@@ -1,0 +1,37 @@
+ai-playlist-composer/.env
+album-normalizer/.env
+album-queue/.env
+deduplicator/.env
+dynamic-playlists/.env
+music-files-indexer/.env
+spotdl-wapper/.env
+
+album-queue/.DS_Store
+album-normalizer/.DS_Store
+deduplicator/.DS_Store
+dynamic-playlists/.DS_Store
+music-files-indexer/.DS_Store
+spotdl-wapper/.DS_Store
+ai-playlist-composer/.DS_Store
+models/.DS_Store
+.DS_Store
+
+music-files-indexer/music-files-indexer
+album-queue/album-queue
+album-normalizer/album-normalizer
+deduplicator/deduplicator
+dynamic-playlists/dynamic-playlists
+spotdl-wapper/spotdl-wapper
+ai-playlist-composer/ai-playlist-composer
+models/models
+.DS_Store
+
+# Compiled binaries
+music-files-indexer/music-files-indexer
+**/main
+**/*.exe
+
+# Or more generally for Go binaries
+**/*-indexer
+**/*-wrapper
+

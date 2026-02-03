@@ -1,0 +1,5 @@
+.vscode
+.env
+Makefile
+*.tar
+album-queue
