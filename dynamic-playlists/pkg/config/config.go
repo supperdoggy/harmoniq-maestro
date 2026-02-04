@@ -8,6 +8,8 @@ type Config struct {
 	OpenAIAPIKey        string `envconfig:"OPENAI_API_KEY" required:"true"`
 	MusicLibraryPath    string `envconfig:"MUSIC_LIBRARY_PATH" required:"true"`
 	PlaylistsOutputPath string `envconfig:"PLAYLISTS_OUTPUT_PATH" required:"true"`
+	SpotifyClientID     string `envconfig:"SPOTIFY_CLIENT_ID" required:"true"`
+	SpotifyClientSecret string `envconfig:"SPOTIFY_CLIENT_SECRET" required:"true"`
 	DryRun              bool   `envconfig:"DRY_RUN" default:"false"`
 }
 

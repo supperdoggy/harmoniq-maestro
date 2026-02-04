@@ -2,8 +2,13 @@ package db
 
 import (
 	"context"
+	"fmt"
+	"regexp"
+	"time"
 
-	"github.com/supperdoggy/spot-models"
+	"github.com/gofrs/uuid"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/models"
+	"github.com/supperdoggy/spot-models/spotify"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -16,6 +21,11 @@ type Database interface {
 	UpdateDynamicPlaylist(ctx context.Context, playlist models.DynamicPlaylist) error
 	FindMusicFilesByQuery(ctx context.Context, query bson.M, sortBy string, limit int) ([]models.MusicFile, error)
 	GetAllGenreMappings(ctx context.Context) ([]models.GenreMapping, error)
+	GetActiveSubscribedPlaylists(ctx context.Context) ([]models.SubscribedPlaylist, error)
+	UpdateSubscribedPlaylist(ctx context.Context, playlist models.SubscribedPlaylist) error
+	FindMusicFiles(ctx context.Context, artists, titles []string) ([]models.MusicFile, error)
+	CheckIfRequestAlreadySynced(ctx context.Context, url string) (bool, error)
+	NewDownloadRequest(ctx context.Context, url, name string, creatorID int64, objectType spotify.SpotifyObjectType) error
 	Close(ctx context.Context) error
 	Ping(ctx context.Context) error
 }
@@ -83,6 +93,26 @@ func (d *db) musicFilesCollection() *mongo.Collection {
 		}
 	}
 	return d.conn.Database(d.dbname).Collection("music-files")
+}
+
+func (d *db) subscribedPlaylistsCollection() *mongo.Collection {
+	if err := d.conn.Ping(context.Background(), nil); err != nil {
+		d.log.Error("failed to ping database. reconnecting.", zap.Error(err))
+		if reconnectErr := d.reconnectToDB(); reconnectErr != nil {
+			d.log.Error("failed to reconnect to database", zap.Error(reconnectErr))
+		}
+	}
+	return d.conn.Database(d.dbname).Collection("subscribed_playlists")
+}
+
+func (d *db) downloadQueueRequestCollection() *mongo.Collection {
+	if err := d.conn.Ping(context.Background(), nil); err != nil {
+		d.log.Error("failed to ping database. reconnecting.", zap.Error(err))
+		if reconnectErr := d.reconnectToDB(); reconnectErr != nil {
+			d.log.Error("failed to reconnect to database", zap.Error(reconnectErr))
+		}
+	}
+	return d.conn.Database(d.dbname).Collection("download-queue-requests")
 }
 
 func (d *db) GetActiveDynamicPlaylists(ctx context.Context) ([]models.DynamicPlaylist, error) {
@@ -208,4 +238,114 @@ func (d *db) Close(ctx context.Context) error {
 
 func (d *db) Ping(ctx context.Context) error {
 	return d.conn.Ping(ctx, nil)
+}
+
+func (d *db) GetActiveSubscribedPlaylists(ctx context.Context) ([]models.SubscribedPlaylist, error) {
+	cur, err := d.subscribedPlaylistsCollection().Find(ctx, bson.M{"active": true})
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+
+	playlists := make([]models.SubscribedPlaylist, 0)
+	for cur.Next(ctx) {
+		var playlist models.SubscribedPlaylist
+		if err := cur.Decode(&playlist); err != nil {
+			d.log.Error("failed to decode subscribed playlist", zap.Error(err))
+			continue
+		}
+		playlists = append(playlists, playlist)
+	}
+	if err := cur.Err(); err != nil {
+		return nil, err
+	}
+
+	return playlists, nil
+}
+
+func (d *db) UpdateSubscribedPlaylist(ctx context.Context, playlist models.SubscribedPlaylist) error {
+	_, err := d.subscribedPlaylistsCollection().UpdateOne(
+		ctx,
+		bson.M{"_id": playlist.ID},
+		bson.M{"$set": playlist},
+	)
+	return err
+}
+
+func escapeRegex(s string) string {
+	return regexp.QuoteMeta(s)
+}
+
+func (d *db) FindMusicFiles(ctx context.Context, artists, titles []string) ([]models.MusicFile, error) {
+	if len(artists) != len(titles) {
+		return nil, fmt.Errorf("artists and titles must have the same length")
+	}
+
+	orPairs := make([]bson.M, 0, len(artists))
+	for i := range artists {
+		// Use case-insensitive regex matching for both artist and title
+		escapedArtist := escapeRegex(artists[i])
+		escapedTitle := escapeRegex(titles[i])
+		orPairs = append(orPairs, bson.M{
+			"$and": []bson.M{
+				{"artist": bson.M{"$regex": "^" + escapedArtist + "$", "$options": "i"}},
+				{"title": bson.M{"$regex": "^" + escapedTitle + "$", "$options": "i"}},
+			},
+		})
+	}
+
+	cur, err := d.musicFilesCollection().Find(ctx, bson.M{
+		"$or": orPairs,
+	}, options.Find().SetProjection(bson.M{"meta_data": 0}))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+
+	files := make([]models.MusicFile, 0)
+	for cur.Next(ctx) {
+		var file models.MusicFile
+		if err := cur.Decode(&file); err != nil {
+			return nil, err
+		}
+		files = append(files, file)
+	}
+	if err := cur.Err(); err != nil {
+		return nil, err
+	}
+
+	return files, nil
+}
+
+func (d *db) CheckIfRequestAlreadySynced(ctx context.Context, url string) (bool, error) {
+	count, err := d.downloadQueueRequestCollection().CountDocuments(ctx, bson.M{"spotify_url": url, "active": false})
+	if err != nil && err != mongo.ErrNoDocuments {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (d *db) NewDownloadRequest(ctx context.Context, url, name string, creatorID int64, objectType spotify.SpotifyObjectType) error {
+	id, err := uuid.NewV4()
+	if err != nil {
+		return err
+	}
+
+	request := models.DownloadQueueRequest{
+		SpotifyURL: url,
+		ObjectType: objectType,
+		Name:       name,
+		Active:     true,
+		ID:         id.String(),
+		CreatedAt:  time.Now().Unix(),
+		UpdatedAt:  time.Now().Unix(),
+		CreatorID:  creatorID,
+	}
+
+	_, err = d.downloadQueueRequestCollection().InsertOne(ctx, request)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
