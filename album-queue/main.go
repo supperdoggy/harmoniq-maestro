@@ -113,6 +113,9 @@ func main() {
 	bot.Handle("/deactivate", h.HandleDeactivate)
 	bot.Handle("/p", h.HandlePlaylist)
 	bot.Handle("/pnp", h.HandlePlaylistNoPull)
+	bot.Handle("/subscribe", h.HandleSubscribe)
+	bot.Handle("/unsubscribe", h.HandleUnsubscribe)
+	bot.Handle("/subscriptions", h.HandleListSubscriptions)
 
 	// Graceful shutdown
 	shutdownDone := make(chan struct{})
