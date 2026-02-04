@@ -1,4 +1,4 @@
-module github.com/supperdoggy/SmartHomeServer/music-services/dynamic-playlists
+module github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists
 
 go 1.23.0
 

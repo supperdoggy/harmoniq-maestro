@@ -1,4 +1,4 @@
-module github.com/supperdoggy/SmartHomeServer/music-services/album-queue
+module github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/album-queue
 
 go 1.23.0
 

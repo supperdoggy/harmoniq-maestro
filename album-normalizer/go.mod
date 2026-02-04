@@ -1,4 +1,4 @@
-module github.com/supperdoggy/SmartHomeServer/music-services/album-normalizer
+module github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/album-normalizer
 
 go 1.23.4
 

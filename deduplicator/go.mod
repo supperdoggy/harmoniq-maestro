@@ -1,10 +1,12 @@
-module github.com/supperdoggy/SmartHomeServer/music-services/deduplicator
+module github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/deduplicator
 
 go 1.23.4
 
+replace github.com/supperdoggy/spot-models => ../models
+
 require (
-	github.com/DigitalIndependence/models v0.0.0-20250512150954-19ae8a85dfcd
 	github.com/sethvargo/go-envconfig v1.3.0
+	github.com/supperdoggy/spot-models v0.0.0
 	go.uber.org/zap v1.27.0
 )
 

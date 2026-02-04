@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/supperdoggy/SmartHomeServer/music-services/album-queue/pkg/db"
-	"github.com/supperdoggy/SmartHomeServer/music-services/album-queue/pkg/utils"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/album-queue/pkg/db"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/album-queue/pkg/utils"
 	models "github.com/supperdoggy/spot-models"
 	"github.com/supperdoggy/spot-models/spotify"
 	"go.uber.org/zap"

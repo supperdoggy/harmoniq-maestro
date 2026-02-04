@@ -1,4 +1,4 @@
-module github.com/supperdoggy/SmartHomeServer/music-services/spotdl-wapper
+module github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/spotdl-wapper
 
 go 1.23.0
 

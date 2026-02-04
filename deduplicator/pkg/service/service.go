@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/DigitalIndependence/models/database"
-	"github.com/supperdoggy/SmartHomeServer/music-services/deduplicator/pkg/config"
-	"github.com/supperdoggy/SmartHomeServer/music-services/deduplicator/pkg/utils"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/deduplicator/pkg/config"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/deduplicator/pkg/utils"
+	"github.com/supperdoggy/spot-models/database"
 	"go.uber.org/zap"
 )
 

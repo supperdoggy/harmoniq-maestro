@@ -6,12 +6,12 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/supperdoggy/SmartHomeServer/music-services/dynamic-playlists/pkg/config"
-	"github.com/supperdoggy/SmartHomeServer/music-services/dynamic-playlists/pkg/db"
-	"github.com/supperdoggy/SmartHomeServer/music-services/dynamic-playlists/pkg/genre"
-	"github.com/supperdoggy/SmartHomeServer/music-services/dynamic-playlists/pkg/openai"
-	"github.com/supperdoggy/SmartHomeServer/music-services/dynamic-playlists/pkg/service"
-	"github.com/supperdoggy/spot-models"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists/pkg/config"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists/pkg/db"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists/pkg/genre"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists/pkg/openai"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists/pkg/service"
+	"github.com/supperdoggy/SmartHomeServer/music-services/models"
 )
 
 func main() {

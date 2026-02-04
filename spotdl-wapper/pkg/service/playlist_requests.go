@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/supperdoggy/SmartHomeServer/music-services/spotdl-wapper/pkg/utils"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/spotdl-wapper/pkg/utils"
 	models "github.com/supperdoggy/spot-models"
 	"github.com/supperdoggy/spot-models/spotify"
 	spotifyapi "github.com/zmb3/spotify/v2"

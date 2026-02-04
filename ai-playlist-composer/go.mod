@@ -1,4 +1,4 @@
-module github.com/supperdoggy/SmartHomeServer/music-services/ai-playlist-composer
+module github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/ai-playlist-composer
 
 go 1.23.4
 

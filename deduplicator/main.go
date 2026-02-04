@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 
-	"github.com/supperdoggy/SmartHomeServer/music-services/deduplicator/pkg/config"
-	"github.com/supperdoggy/SmartHomeServer/music-services/deduplicator/pkg/service"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/deduplicator/pkg/config"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/deduplicator/pkg/service"
 	"go.uber.org/zap"
 )
 

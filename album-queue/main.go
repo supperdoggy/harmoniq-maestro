@@ -9,9 +9,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/supperdoggy/SmartHomeServer/music-services/album-queue/pkg/config"
-	"github.com/supperdoggy/SmartHomeServer/music-services/album-queue/pkg/db"
-	"github.com/supperdoggy/SmartHomeServer/music-services/album-queue/pkg/handler"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/album-queue/pkg/config"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/album-queue/pkg/db"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/album-queue/pkg/handler"
 	"github.com/supperdoggy/spot-models/spotify"
 	"go.uber.org/zap"
 	"gopkg.in/tucnak/telebot.v2"

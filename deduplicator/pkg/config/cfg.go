@@ -3,8 +3,8 @@ package config
 import (
 	"context"
 
-	"github.com/DigitalIndependence/models/database"
 	"github.com/sethvargo/go-envconfig"
+	"github.com/supperdoggy/spot-models/database"
 )
 
 type Config struct {

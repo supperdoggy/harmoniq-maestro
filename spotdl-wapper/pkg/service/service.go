@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/supperdoggy/SmartHomeServer/music-services/spotdl-wapper/pkg/db"
+	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/spotdl-wapper/pkg/db"
 	"github.com/supperdoggy/spot-models/spotify"
 	"go.uber.org/zap"
 )
