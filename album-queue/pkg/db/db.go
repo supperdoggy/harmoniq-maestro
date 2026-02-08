@@ -3,6 +3,9 @@ package db
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
 
 	uuid "github.com/satori/go.uuid"
@@ -17,6 +20,9 @@ import (
 type Database interface {
 	NewDownloadRequest(ctx context.Context, url, name string, creatorID int64, objectType spotify.SpotifyObjectType, expectedTrackCount int, trackMetadata []spotify.TrackMetadata) error
 	GetActiveRequests(ctx context.Context) ([]models.DownloadQueueRequest, error)
+	GetUnresolvedFailedTracks(ctx context.Context) ([]FailedTrack, error)
+	GetUnresolvedFailedTrackByURL(ctx context.Context, trackURL string) (FailedTrack, error)
+	HasActiveRequestByURL(ctx context.Context, trackURL string) (bool, error)
 	DeactivateRequest(ctx context.Context, id string) error
 	NewPlaylistRequest(ctx context.Context, url string, creatorID int64, noPull bool) error
 	GetActivePlaylists(ctx context.Context) ([]models.PlaylistRequest, error)
@@ -32,6 +38,15 @@ type Stats struct {
 	ActiveDownloadQueue   int64 `json:"active_download_queue"`
 	TotalDownloadRequests int64 `json:"total_download_requests"`
 	ActivePlaylists       int64 `json:"active_playlists"`
+}
+
+type FailedTrack struct {
+	SpotifyURL     string `json:"spotify_url"`
+	Artist         string `json:"artist"`
+	Title          string `json:"title"`
+	FailedAttempts int    `json:"failed_attempts"`
+	SourceCount    int    `json:"source_count"`
+	LastSeenAt     int64  `json:"last_seen_at"`
 }
 
 type db struct {
@@ -132,6 +147,55 @@ func (d *db) GetActiveRequests(ctx context.Context) ([]models.DownloadQueueReque
 	}
 
 	return requests, nil
+}
+
+func (d *db) GetUnresolvedFailedTracks(ctx context.Context) ([]FailedTrack, error) {
+	filter := bson.M{
+		"track_metadata": bson.M{
+			"$elemMatch": bson.M{
+				"found": bson.M{"$ne": true},
+			},
+		},
+	}
+
+	cursor, err := d.downloadQueueRequestCollection.Find(ctx, filter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find requests with unresolved tracks: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	requests := make([]models.DownloadQueueRequest, 0)
+	if err := cursor.All(ctx, &requests); err != nil {
+		return nil, fmt.Errorf("failed to decode requests with unresolved tracks: %w", err)
+	}
+
+	tracks, err := filterUnresolvedFailedTracks(ctx, requests, d.musicFileExistsInsensitive, d.HasActiveRequestByURL)
+	if err != nil {
+		return nil, err
+	}
+
+	return tracks, nil
+}
+
+func (d *db) GetUnresolvedFailedTrackByURL(ctx context.Context, trackURL string) (FailedTrack, error) {
+	tracks, err := d.GetUnresolvedFailedTracks(ctx)
+	if err != nil {
+		return FailedTrack{}, err
+	}
+
+	return selectFailedTrackByURL(tracks, trackURL)
+}
+
+func (d *db) HasActiveRequestByURL(ctx context.Context, trackURL string) (bool, error) {
+	count, err := d.downloadQueueRequestCollection.CountDocuments(ctx, bson.M{
+		"spotify_url": trackURL,
+		"active":      true,
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to check active request by url: %w", err)
+	}
+
+	return count > 0, nil
 }
 
 func (d *db) GetActivePlaylists(ctx context.Context) ([]models.PlaylistRequest, error) {
@@ -260,4 +324,111 @@ func (d *db) GetStats(ctx context.Context) (*Stats, error) {
 	stats.ActivePlaylists = activePlaylists
 
 	return stats, nil
+}
+
+func (d *db) musicFileExistsInsensitive(ctx context.Context, artist, title string) (bool, error) {
+	if strings.TrimSpace(artist) == "" || strings.TrimSpace(title) == "" {
+		return false, nil
+	}
+
+	escapedArtist := regexp.QuoteMeta(artist)
+	escapedTitle := regexp.QuoteMeta(title)
+
+	count, err := d.musicFilesCollection.CountDocuments(ctx, bson.M{
+		"$and": []bson.M{
+			{"artist": bson.M{"$regex": "^" + escapedArtist + "$", "$options": "i"}},
+			{"title": bson.M{"$regex": "^" + escapedTitle + "$", "$options": "i"}},
+		},
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to check indexed track existence: %w", err)
+	}
+
+	return count > 0, nil
+}
+
+func filterUnresolvedFailedTracks(
+	ctx context.Context,
+	requests []models.DownloadQueueRequest,
+	musicFileExists func(context.Context, string, string) (bool, error),
+	hasActiveRequestByURL func(context.Context, string) (bool, error),
+) ([]FailedTrack, error) {
+	failedByURL := make(map[string]FailedTrack)
+
+	for _, request := range requests {
+		lastSeen := request.UpdatedAt
+		if lastSeen == 0 {
+			lastSeen = request.CreatedAt
+		}
+
+		for _, track := range request.TrackMetadata {
+			if track.Found || strings.TrimSpace(track.SpotifyURL) == "" {
+				continue
+			}
+
+			existsInLibrary, err := musicFileExists(ctx, track.Artist, track.Title)
+			if err != nil {
+				return nil, err
+			}
+			if existsInLibrary {
+				continue
+			}
+
+			hasActive, err := hasActiveRequestByURL(ctx, track.SpotifyURL)
+			if err != nil {
+				return nil, err
+			}
+			if hasActive {
+				continue
+			}
+
+			current, exists := failedByURL[track.SpotifyURL]
+			if !exists {
+				failedByURL[track.SpotifyURL] = FailedTrack{
+					SpotifyURL:     track.SpotifyURL,
+					Artist:         track.Artist,
+					Title:          track.Title,
+					FailedAttempts: track.FailedAttempts,
+					SourceCount:    1,
+					LastSeenAt:     lastSeen,
+				}
+				continue
+			}
+
+			current.SourceCount++
+			if track.FailedAttempts > current.FailedAttempts {
+				current.FailedAttempts = track.FailedAttempts
+			}
+			if lastSeen >= current.LastSeenAt {
+				current.LastSeenAt = lastSeen
+				current.Artist = track.Artist
+				current.Title = track.Title
+			}
+			failedByURL[track.SpotifyURL] = current
+		}
+	}
+
+	failedTracks := make([]FailedTrack, 0, len(failedByURL))
+	for _, track := range failedByURL {
+		failedTracks = append(failedTracks, track)
+	}
+
+	sort.Slice(failedTracks, func(i, j int) bool {
+		if failedTracks[i].LastSeenAt == failedTracks[j].LastSeenAt {
+			return failedTracks[i].SpotifyURL < failedTracks[j].SpotifyURL
+		}
+		return failedTracks[i].LastSeenAt > failedTracks[j].LastSeenAt
+	})
+
+	return failedTracks, nil
+}
+
+func selectFailedTrackByURL(tracks []FailedTrack, trackURL string) (FailedTrack, error) {
+	for _, track := range tracks {
+		if track.SpotifyURL == trackURL {
+			return track, nil
+		}
+	}
+
+	return FailedTrack{}, mongo.ErrNoDocuments
 }

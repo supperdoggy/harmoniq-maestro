@@ -70,6 +70,8 @@ docker run -d \
 |---------|-------------|
 | `/start` | Welcome message |
 | `/queue` | Show active download requests |
+| `/failed` | Show unresolved failed track pulls |
+| `/redownload <track_url>` | Requeue a failed Spotify track |
 | `/deactivate <id>` | Deactivate a specific request |
 | `/p <url>` | Add a playlist to the queue |
 | `/pnp <url>` | Add a playlist without pulling missing songs |
