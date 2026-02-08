@@ -27,6 +27,9 @@ type Handler interface {
 	HandleDeactivate(m *telebot.Message)
 	HandlePlaylist(m *telebot.Message)
 	HandlePlaylistNoPull(m *telebot.Message)
+	HandleSubscribe(m *telebot.Message)
+	HandleUnsubscribe(m *telebot.Message)
+	HandleListSubscriptions(m *telebot.Message)
 }
 
 const (
@@ -659,4 +662,168 @@ func (h *handler) HandlePlaylistNoPull(m *telebot.Message) {
 	h.sendWebhook()
 
 	h.reply(m, "Ураураура успішно додали плейлист в чергу!!!!")
+}
+
+func (h *handler) HandleSubscribe(m *telebot.Message) {
+	if !utils.InWhiteList(m.Sender.ID, h.whiteList) {
+		h.log.Info("Unauthorized user", zap.Int64("user_id", m.Sender.ID))
+		return
+	}
+
+	h.log.Info("Received subscribe request", zap.Any("message", m.Text))
+
+	msg := strings.Split(m.Text, " ")
+	if len(msg) < 2 {
+		h.reply(m, "не розумію цю команду. Пліз юзай /subscribe <playlist_url> [weekly|nopull].")
+		return
+	}
+
+	playlistURL := msg[1]
+	if !utils.IsValidSpotifyURL(playlistURL) {
+		h.reply(m, "о ніііііі, це не посилання на спотіфай.... 💔😭")
+		return
+	}
+
+	// Parse optional parameters
+	refreshInterval := "daily"
+	noPull := false
+	if len(msg) > 2 {
+		for _, param := range msg[2:] {
+			switch strings.ToLower(param) {
+			case "weekly":
+				refreshInterval = "weekly"
+			case "hourly":
+				refreshInterval = "hourly"
+			case "nopull":
+				noPull = true
+			}
+		}
+	}
+
+	ctx := context.Background()
+
+	// Check if subscription already exists
+	exists, err := h.db.CheckSubscriptionExists(ctx, playlistURL, m.Sender.ID)
+	if err != nil {
+		h.log.Error("Failed to check subscription existence", zap.Error(err))
+		h.reply(m, "не получилось перевірити підписку, спробуй ще раз...")
+		return
+	}
+	if exists {
+		h.reply(m, "ти вже підписаний на цей плейлист! 🎵")
+		return
+	}
+
+	// Get playlist name from Spotify
+	playlistName, err := h.spotifyService.GetObjectName(ctx, playlistURL)
+	if err != nil {
+		h.log.Error("Failed to get playlist name", zap.Error(err))
+		h.reply(m, "не получилось отримати назву плейлиста зі спотіфай, спробуй ще раз...")
+		return
+	}
+
+	// Create subscription
+	if err := h.db.NewSubscribedPlaylist(ctx, playlistURL, m.Sender.ID, playlistName, refreshInterval, noPull); err != nil {
+		h.log.Error("Failed to create subscription", zap.Error(err))
+		h.reply(m, "не получилось створити підписку, скажи максиму шо шось не так...")
+		return
+	}
+
+	intervalText := "щодня"
+	if refreshInterval == "weekly" {
+		intervalText = "щотижня"
+	} else if refreshInterval == "hourly" {
+		intervalText = "щогодини"
+	}
+
+	pullText := "з завантаженням відсутніх треків"
+	if noPull {
+		pullText = "без завантаження відсутніх треків"
+	}
+
+	h.reply(m, fmt.Sprintf("Ураураура успішно підписались на плейлист '%s'! Оновлення %s, %s 🎵❤️", playlistName, intervalText, pullText))
+}
+
+func (h *handler) HandleUnsubscribe(m *telebot.Message) {
+	if !utils.InWhiteList(m.Sender.ID, h.whiteList) {
+		h.log.Info("Unauthorized user", zap.Int64("user_id", m.Sender.ID))
+		return
+	}
+
+	h.log.Info("Received unsubscribe request", zap.Any("message", m.Text))
+
+	msg := strings.Split(m.Text, " ")
+	if len(msg) != 2 {
+		h.reply(m, "не розумію цю команду. Пліз юзай /unsubscribe <playlist_url>.")
+		return
+	}
+
+	playlistURL := msg[1]
+	if !utils.IsValidSpotifyURL(playlistURL) {
+		h.reply(m, "о ніііііі, це не посилання на спотіфай.... 💔😭")
+		return
+	}
+
+	ctx := context.Background()
+
+	if err := h.db.DeleteSubscribedPlaylist(ctx, playlistURL, m.Sender.ID); err != nil {
+		h.log.Error("Failed to unsubscribe", zap.Error(err))
+		h.reply(m, "не получилось відписатись, можливо ти не підписаний на цей плейлист?")
+		return
+	}
+
+	h.reply(m, "Успішно відписались від плейлиста! 👋")
+}
+
+func (h *handler) HandleListSubscriptions(m *telebot.Message) {
+	if !utils.InWhiteList(m.Sender.ID, h.whiteList) {
+		h.log.Info("Unauthorized user", zap.Int64("user_id", m.Sender.ID))
+		return
+	}
+
+	ctx := context.Background()
+	subscriptions, err := h.db.GetSubscribedPlaylists(ctx, m.Sender.ID)
+	if err != nil {
+		h.log.Error("Failed to get subscriptions", zap.Error(err))
+		h.reply(m, "не получилось отримати список підписок... 💔😭")
+		return
+	}
+
+	if len(subscriptions) == 0 {
+		h.reply(m, "немає активних підписок на плейлисти...")
+		return
+	}
+
+	response := "Твої активні підписки:\n\n"
+	for _, sub := range subscriptions {
+		intervalText := "щодня"
+		if sub.RefreshInterval == "weekly" {
+			intervalText = "щотижня"
+		} else if sub.RefreshInterval == "hourly" {
+			intervalText = "щогодини"
+		}
+
+		pullText := "з завантаженням"
+		if sub.NoPull {
+			pullText = "без завантаження"
+		}
+
+		lastSyncedText := "ще не синхронізовано"
+		if sub.LastSynced > 0 {
+			lastSynced := time.Unix(sub.LastSynced, 0)
+			lastSyncedText = lastSynced.Format("02.01.2006 15:04")
+		}
+
+		response += fmt.Sprintf("🎵 %s\n", sub.Name)
+		response += fmt.Sprintf("   📎 %s\n", sub.SpotifyURL)
+		response += fmt.Sprintf("   ⏰ Оновлення: %s\n", intervalText)
+		response += fmt.Sprintf("   📥 %s\n", pullText)
+		response += fmt.Sprintf("   🕐 Остання синхронізація: %s\n", lastSyncedText)
+		if sub.LastTrackCount > 0 {
+			response += fmt.Sprintf("   🎶 Треків: %d\n", sub.LastTrackCount)
+		}
+		response += "\n"
+	}
+
+	h.reply(m, response)
 }

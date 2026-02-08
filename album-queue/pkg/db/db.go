@@ -28,6 +28,10 @@ type Database interface {
 	GetActivePlaylists(ctx context.Context) ([]models.PlaylistRequest, error)
 	FindMusicFiles(ctx context.Context, artists, titles []string) ([]models.MusicFile, error)
 	UpdateDownloadRequest(ctx context.Context, request models.DownloadQueueRequest) error
+	NewSubscribedPlaylist(ctx context.Context, url string, creatorID int64, name string, refreshInterval string, noPull bool) error
+	GetSubscribedPlaylists(ctx context.Context, creatorID int64) ([]models.SubscribedPlaylist, error)
+	DeleteSubscribedPlaylist(ctx context.Context, url string, creatorID int64) error
+	CheckSubscriptionExists(ctx context.Context, url string, creatorID int64) (bool, error)
 	Close(ctx context.Context) error
 	Ping(ctx context.Context) error
 	GetStats(ctx context.Context) (*Stats, error)
@@ -56,6 +60,7 @@ type db struct {
 	// Collections
 	downloadQueueRequestCollection *mongo.Collection
 	playlistRequestCollection      *mongo.Collection
+	subscribedPlaylistsCollection  *mongo.Collection
 	musicFilesCollection           *mongo.Collection
 	dbname                         string
 }
@@ -78,6 +83,7 @@ func NewDatabase(ctx context.Context, log *zap.Logger, url, dbname string) (Data
 
 		downloadQueueRequestCollection: conn.Database(dbname).Collection("download-queue-requests"),
 		playlistRequestCollection:      conn.Database(dbname).Collection("playlist-requests"),
+		subscribedPlaylistsCollection:  conn.Database(dbname).Collection("subscribed_playlists"),
 		musicFilesCollection:           conn.Database(dbname).Collection("music-files"),
 	}, nil
 }
@@ -324,6 +330,75 @@ func (d *db) GetStats(ctx context.Context) (*Stats, error) {
 	stats.ActivePlaylists = activePlaylists
 
 	return stats, nil
+}
+
+func (d *db) NewSubscribedPlaylist(ctx context.Context, url string, creatorID int64, name string, refreshInterval string, noPull bool) error {
+	id := uuid.NewV4()
+	playlist := models.SubscribedPlaylist{
+		ID:              id.String(),
+		CreatorID:       creatorID,
+		SpotifyURL:      url,
+		Name:            name,
+		Active:          true,
+		RefreshInterval: refreshInterval,
+		NoPull:          noPull,
+		LastSynced:      0,
+		LastTrackCount:  0,
+		CreatedAt:       time.Now().Unix(),
+		UpdatedAt:       time.Now().Unix(),
+	}
+
+	_, err := d.subscribedPlaylistsCollection.InsertOne(ctx, playlist)
+	if err != nil {
+		return fmt.Errorf("failed to insert subscribed playlist: %w", err)
+	}
+
+	return nil
+}
+
+func (d *db) GetSubscribedPlaylists(ctx context.Context, creatorID int64) ([]models.SubscribedPlaylist, error) {
+	var playlists []models.SubscribedPlaylist
+
+	cursor, err := d.subscribedPlaylistsCollection.Find(ctx, bson.M{"creator_id": creatorID, "active": true})
+	if err != nil {
+		return nil, fmt.Errorf("failed to find subscribed playlists: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	if err := cursor.All(ctx, &playlists); err != nil {
+		return nil, fmt.Errorf("failed to decode subscribed playlists: %w", err)
+	}
+
+	return playlists, nil
+}
+
+func (d *db) DeleteSubscribedPlaylist(ctx context.Context, url string, creatorID int64) error {
+	result, err := d.subscribedPlaylistsCollection.UpdateOne(
+		ctx,
+		bson.M{"spotify_url": url, "creator_id": creatorID},
+		bson.M{"$set": bson.M{"active": false, "updated_at": time.Now().Unix()}},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to delete subscribed playlist: %w", err)
+	}
+
+	if result.MatchedCount == 0 {
+		return fmt.Errorf("subscription not found")
+	}
+
+	return nil
+}
+
+func (d *db) CheckSubscriptionExists(ctx context.Context, url string, creatorID int64) (bool, error) {
+	count, err := d.subscribedPlaylistsCollection.CountDocuments(ctx, bson.M{
+		"spotify_url": url,
+		"creator_id":  creatorID,
+		"active":      true,
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to check subscription existence: %w", err)
+	}
+	return count > 0, nil
 }
 
 func (d *db) musicFileExistsInsensitive(ctx context.Context, artist, title string) (bool, error) {

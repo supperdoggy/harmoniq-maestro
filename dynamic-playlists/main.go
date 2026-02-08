@@ -11,7 +11,8 @@ import (
 	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists/pkg/genre"
 	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists/pkg/openai"
 	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists/pkg/service"
-	"github.com/supperdoggy/SmartHomeServer/music-services/models"
+	models "github.com/supperdoggy/spot-models"
+	"github.com/supperdoggy/spot-models/spotify"
 )
 
 func main() {
@@ -76,10 +77,28 @@ func main() {
 	// Initialize service (database implements ServiceDB interface)
 	svc := service.NewService(database, playlistGenerator, openAIClient, logger)
 
+	// Initialize Spotify service for subscribed playlists
+	spotifyService := spotify.NewSpotifyService(ctx, cfg.SpotifyClientID, cfg.SpotifyClientSecret, logger)
+
+	// Initialize subscribed playlists processor
+	subscribedPlaylistsProcessor := service.NewSubscribedPlaylistsProcessor(
+		database,
+		spotifyService,
+		cfg.MusicLibraryPath,
+		cfg.PlaylistsOutputPath,
+		logger,
+	)
+
 	// Process playlists
 	logger.Info("Processing dynamic playlists...")
 	if err := svc.ProcessPlaylists(ctx); err != nil {
-		logger.Fatal("Failed to process playlists", zap.Error(err))
+		logger.Error("Failed to process playlists", zap.Error(err))
+	}
+
+	// Process subscribed playlists
+	logger.Info("Processing subscribed playlists...")
+	if err := subscribedPlaylistsProcessor.ProcessSubscribedPlaylists(ctx); err != nil {
+		logger.Error("Failed to process subscribed playlists", zap.Error(err))
 	}
 
 	logger.Info("Dynamic playlists processing completed successfully")

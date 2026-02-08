@@ -84,6 +84,22 @@ func (f *fakeDatabase) UpdateDownloadRequest(context.Context, models.DownloadQue
 	return nil
 }
 
+func (f *fakeDatabase) NewSubscribedPlaylist(context.Context, string, int64, string, string, bool) error {
+	return nil
+}
+
+func (f *fakeDatabase) GetSubscribedPlaylists(context.Context, int64) ([]models.SubscribedPlaylist, error) {
+	return nil, nil
+}
+
+func (f *fakeDatabase) DeleteSubscribedPlaylist(context.Context, string, int64) error {
+	return nil
+}
+
+func (f *fakeDatabase) CheckSubscriptionExists(context.Context, string, int64) (bool, error) {
+	return false, nil
+}
+
 func (f *fakeDatabase) Close(context.Context) error {
 	return nil
 }

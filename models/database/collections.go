@@ -73,3 +73,14 @@ func (d *db) genreMappingsCollection() *mongo.Collection {
 
 	return d.conn.Database(d.cfg.DatabaseName).Collection("genre_mappings")
 }
+
+func (d *db) subscribedPlaylistsCollection() *mongo.Collection {
+	if err := d.conn.Ping(context.Background(), nil); err != nil {
+		d.log.Error("failed to ping database. reconnecting.", zap.Error(err))
+		if reconnectErr := d.reconnectToDB(); reconnectErr != nil {
+			d.log.Error("failed to reconnect to database", zap.Error(reconnectErr))
+		}
+	}
+
+	return d.conn.Database(d.cfg.DatabaseName).Collection("subscribed_playlists")
+}
