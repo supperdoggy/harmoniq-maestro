@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid"
-	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/models"
+	models "github.com/supperdoggy/spot-models"
 	"github.com/supperdoggy/spot-models/spotify"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"

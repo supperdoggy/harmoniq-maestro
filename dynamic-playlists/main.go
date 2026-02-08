@@ -11,7 +11,7 @@ import (
 	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists/pkg/genre"
 	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists/pkg/openai"
 	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/dynamic-playlists/pkg/service"
-	"github.com/supperdoggy/SmartHomeServer/music-services/models"
+	models "github.com/supperdoggy/spot-models"
 	"github.com/supperdoggy/spot-models/spotify"
 )
 
