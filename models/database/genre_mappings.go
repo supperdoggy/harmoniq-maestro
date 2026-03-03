@@ -3,7 +3,7 @@ package database
 import (
 	"context"
 
-	"github.com/supperdoggy/SmartHomeServer/music-services/models"
+	models "github.com/supperdoggy/spot-models"
 	"go.uber.org/zap"
 	"gopkg.in/mgo.v2/bson"
 )

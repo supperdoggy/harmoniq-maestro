@@ -29,7 +29,7 @@ func run() {
 	}
 
 	log := buildLogger(cfg)
-	defer log.Sync()
+	defer func() { _ = log.Sync() }()
 
 	log.Info("loaded config", zap.Any("config", cfg))
 

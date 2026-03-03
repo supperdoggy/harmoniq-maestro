@@ -6,14 +6,17 @@ RUN apk add --no-cache git ca-certificates
 
 WORKDIR /app
 
+# Copy shared module used by local replace directives
+COPY models /models
+
 # Copy go.mod and go.sum files to the workspace
-COPY go.mod go.sum ./
+COPY spotdl-wapper/go.mod spotdl-wapper/go.sum ./
 
 # Download all Go modules
 RUN go mod download
 
 # Copy the rest of the application's source code
-COPY . .
+COPY spotdl-wapper/ .
 
 # Build the Go app
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o spotdl-wapper .

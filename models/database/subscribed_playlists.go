@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/gofrs/uuid"
-	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/models"
+	models "github.com/supperdoggy/spot-models"
 	"gopkg.in/mgo.v2/bson"
 )
 

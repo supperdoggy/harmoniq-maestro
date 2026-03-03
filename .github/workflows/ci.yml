@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  test-core:
+    name: test (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [models, album-queue, dynamic-playlists, spotdl-wapper]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Run tests
+        working-directory: ${{ matrix.module }}
+        run: go test ./...
+
+  lint-core:
+    name: lint (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [models, album-queue, dynamic-playlists, spotdl-wapper]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.61
+          working-directory: ${{ matrix.module }}
+          args: ./...
+
+  build-core-linux:
+    name: build-linux (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    needs: [test-core, lint-core]
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [album-queue, dynamic-playlists, spotdl-wapper]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Build linux binary
+        working-directory: ${{ matrix.module }}
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: go build -v -o app .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.module }}-linux-amd64
+          path: ${{ matrix.module }}/app
+
+  compile-sanity:
+    name: compile-sanity (spotdl-wapper/${{ matrix.goos }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - name: Compile without running
+        working-directory: spotdl-wapper
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: amd64
+        run: go build -v .

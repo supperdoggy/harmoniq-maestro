@@ -35,3 +35,23 @@ music-files-indexer/music-files-indexer
 **/*-indexer
 **/*-wrapper
 
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Secrets and credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# Local tooling outputs
+.gitleaks-report.json
+coverage.out
+
+# Build artifacts
+dist/
+bin/

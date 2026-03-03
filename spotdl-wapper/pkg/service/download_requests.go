@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	models "github.com/supperdoggy/spot-models"
@@ -235,10 +234,7 @@ func (s *service) processBulkDownload(ctx context.Context, request models.Downlo
 
 	// Run the "spotdl --sync {url}" command
 	cmd := exec.Command("spotdl", args...)
-	// Kill child process when parent dies
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig: syscall.SIGKILL,
-	}
+	configureSysProcAttr(cmd)
 
 	s.log.Info("executing command", zap.String("command", cmd.String()))
 
@@ -472,10 +468,7 @@ func (s *service) DownloadSingleTrack(ctx context.Context, trackURL string) erro
 	}
 
 	cmd := exec.Command("spotdl", args...)
-	// Kill child process when parent dies
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Pdeathsig: syscall.SIGKILL,
-	}
+	configureSysProcAttr(cmd)
 
 	s.log.Info("executing spotdl for single track", zap.String("url", trackURL))
 

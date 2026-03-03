@@ -1,0 +1,92 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: harmoniq-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh \"mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@localhost:27017/admin\" --quiet --eval \"db.runCommand({ ping: 1 }).ok\" | grep 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  album-queue:
+    build:
+      context: .
+      dockerfile: album-queue/Dockerfile
+    container_name: harmoniq-album-queue
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      DATABASE_NAME: ${MONGO_DATABASE}
+      BOT_TOKEN: ${BOT_TOKEN}
+      BOT_WHITELIST: ${BOT_WHITELIST}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  spotdl-wapper:
+    build:
+      context: .
+      dockerfile: spotdl-wapper/Dockerfile
+    container_name: harmoniq-spotdl-wapper
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      DATABASE_NAME: ${MONGO_DATABASE}
+      DESTINATION: ${DESTINATION}
+      MUSIC_LIBRARY_PATH: /music
+      SLEEP_IN_MINUTES: ${SLEEP_IN_MINUTES}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET}
+      LOKI_ENABLED: ${LOKI_ENABLED}
+      LOKI_URL: ${LOKI_URL}
+    volumes:
+      - ${MUSIC_LIBRARY_PATH}:/music
+      - ${SPOTDL_CONFIG_PATH}:/home/appuser/.spotdl:ro
+
+  dynamic-playlists:
+    build:
+      context: .
+      dockerfile: dynamic-playlists/Dockerfile
+    container_name: harmoniq-dynamic-playlists
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: mongodb://${MONGO_ROOT_USERNAME}:${MONGO_ROOT_PASSWORD}@mongo:27017/?authSource=admin
+      DATABASE_NAME: ${MONGO_DATABASE}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      MUSIC_LIBRARY_PATH: /music
+      PLAYLISTS_OUTPUT_PATH: ${PLAYLISTS_OUTPUT_PATH}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET}
+      DRY_RUN: ${DRY_RUN}
+    volumes:
+      - ${MUSIC_LIBRARY_PATH}:/music
+    command: ["sh", "-c", "while true; do ./dynamic-playlists; sleep ${DYNAMIC_PLAYLISTS_INTERVAL_SECONDS:-3600}; done"]
+
+volumes:
+  mongo_data:

@@ -1,151 +1,73 @@
 # Harmoniq Maestro
 
-A monorepo for music library management services. This collection of microservices handles Spotify playlist downloads, music file indexing, deduplication, and dynamic playlist generation.
+Harmoniq Maestro is a Linux-first, self-hosted music automation stack.
 
-## Services
+It provides queue-based Spotify ingestion, download processing, and dynamic
+playlist generation over a local music library.
 
-| Service | Description |
-|---------|-------------|
-| [album-queue](./album-queue/) | Telegram bot for queueing Spotify album/playlist downloads |
-| [spotdl-wapper](./spotdl-wapper/) | Go wrapper for spotdl that processes download queue requests |
-| [dynamic-playlists](./dynamic-playlists/) | Generates dynamic playlists based on genre classification using OpenAI |
-| [ai-playlist-composer](./ai-playlist-composer/) | AI-powered playlist composition tool |
-| [album-normalizer](./album-normalizer/) | Normalizes album metadata (ID3 tags, FLAC tags) |
-| [deduplicator](./deduplicator/) | Identifies and removes duplicate music files across playlists |
+## Quickstart
 
-## Shared Packages
-
-| Package | Description |
-|---------|-------------|
-| [models](./models/) | Shared data models and database operations (`github.com/supperdoggy/spot-models`) |
-
-## Architecture
-
-```
-harmoniq-maestro/
-├── models/                    # Shared models package
-│   ├── database/              # MongoDB operations
-│   └── spotify/               # Spotify API types and client
-├── album-queue/               # Telegram bot service
-├── spotdl-wapper/             # Download processor service
-├── dynamic-playlists/         # Playlist generator service
-├── ai-playlist-composer/      # AI playlist tool
-├── album-normalizer/          # Metadata normalizer
-└── deduplicator/              # Duplicate file handler
-```
-
-## Data Flow
-
-```
-┌─────────────┐     ┌──────────────┐     ┌─────────────────┐
-│ album-queue │────▶│ spotdl-wapper│────▶│ Music Library   │
-│ (Telegram)  │     │ (Download)   │     │ (Files on disk) │
-└─────────────┘     └──────────────┘     └────────┬────────┘
-                                                  │
-                    ┌──────────────┐              │
-                    │ deduplicator │◀─────────────┤
-                    └──────────────┘              │
-                                                  │
-                    ┌──────────────────┐          │
-                    │ dynamic-playlists│◀─────────┘
-                    │ (Genre-based)    │
-                    └──────────────────┘
-```
-
-## Prerequisites
-
-- Go 1.23+
-- MongoDB
-- Spotify API credentials
-- OpenAI API key (for dynamic-playlists)
-- [spotdl](https://github.com/spotDL/spotify-downloader) installed (for spotdl-wapper)
-
-## Getting Started
-
-### 1. Clone the repository
+1. Copy environment template:
 
 ```bash
-git clone https://github.com/supperdoggy/SmartHomeServer.git
-cd SmartHomeServer/harmoniq-maestro
+cp .env.example .env
 ```
 
-### 2. Set up environment variables
+2. Edit `.env` with your credentials and paths.
 
-Each service requires specific environment variables. See individual service READMEs for details:
-
-- [album-queue/readme.md](./album-queue/readme.md)
-- [spotdl-wapper/readme.md](./spotdl-wapper/readme.md)
-- [dynamic-playlists/README.md](./dynamic-playlists/README.md)
-
-Common variables across services:
+3. Start core services:
 
 ```bash
-DATABASE_URL="mongodb://localhost:27017"
-DATABASE_NAME="music-services"
+docker compose up -d --build
 ```
 
-### 3. Build a service
+4. Check health:
 
 ```bash
-cd album-queue
-go build -o album-queue .
+curl http://localhost:8080/health
+curl http://localhost:8080/ready
 ```
 
-### 4. Run with Docker (where available)
+Detailed setup is in [docs/quickstart.md](./docs/quickstart.md).
 
-```bash
-cd album-queue
-docker build -t album-queue .
-docker run -e BOT_TOKEN=xxx -e DATABASE_URL=xxx album-queue
-```
+## Supported Core Services
+
+- [album-queue](./album-queue/README.md): Telegram bot that accepts Spotify links and writes queue items.
+- [spotdl-wapper](./spotdl-wapper/README.md): Worker that consumes queue requests and runs `spotdl`.
+- [dynamic-playlists](./dynamic-playlists/README.md): Periodic dynamic and subscribed playlist generation.
+- [models](./models/README.md): Shared models and MongoDB data access layer.
+
+## Experimental Services
+
+These are in the repository but not part of the OSS launch support contract:
+
+- `ai-playlist-composer`
+- `album-normalizer`
+- `deduplicator`
+- `music-files-indexer`
 
 ## Development
 
-### Module Structure
-
-Each service is its own Go module with a local replace directive for the shared models package:
-
-```go
-// go.mod
-module github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/<service-name>
-
-replace github.com/supperdoggy/spot-models => ../models
-
-require (
-    github.com/supperdoggy/spot-models v0.0.0
-    // ... other dependencies
-)
-```
-
-### Running Tests
+Run core checks from repo root:
 
 ```bash
-# Run tests for a specific service
-cd album-queue
-go test ./...
-
-# Run tests for models
-cd models
-go test ./...
+make test-core
+make build-core-linux
 ```
 
-### Adding a New Service
+Optional:
 
-1. Create a new directory: `mkdir new-service && cd new-service`
-2. Initialize the module:
-   ```bash
-   go mod init github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/new-service
-   ```
-3. Add the models replace directive to `go.mod`:
-   ```
-   replace github.com/supperdoggy/spot-models => ../models
-   ```
-4. Import shared models:
-   ```go
-   import "github.com/supperdoggy/spot-models"
-   import "github.com/supperdoggy/spot-models/database"
-   ```
+```bash
+make lint-core
+make scan-secrets
+```
+
+## Legal Notice
+
+This project integrates with third-party APIs/tools (Spotify, OpenAI, `spotdl`,
+and YouTube-related providers). You are responsible for complying with all
+applicable terms, licenses, and local laws.
 
 ## License
 
-MIT
+[MIT](./LICENSE)

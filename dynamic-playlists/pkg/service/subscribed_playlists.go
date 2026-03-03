@@ -142,7 +142,6 @@ func (s *SubscribedPlaylistsProcessor) processSubscription(ctx context.Context, 
 
 	// Track missing songs and indexed paths with metadata
 	missingMusicFiles := []spotifyapi.PlaylistItem{}
-	indexedPaths := make([]string, 0)
 	indexedFiles := make([]models.MusicFile, 0)
 	for _, song := range songList {
 		if song.Track.Track == nil {
@@ -185,7 +184,6 @@ func (s *SubscribedPlaylistsProcessor) processSubscription(ctx context.Context, 
 			continue
 		}
 
-		indexedPaths = append(indexedPaths, foundFile.Path)
 		indexedFiles = append(indexedFiles, foundFile)
 	}
 

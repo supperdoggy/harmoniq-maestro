@@ -1,16 +1,17 @@
 import json
+import os
 import random
 import time
 import requests
 from pymongo import MongoClient
 
 # === CONFIG ===
-MONGO_URI = "mongodb://root:SssnI5NMth5OeedbPmbQ49DxEbT726@100.111.149.52:27017/"
-DB_NAME = "music-services"
-COLLECTION_NAME = "music-files"
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+DB_NAME = os.getenv("DB_NAME", "music-services")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "music-files")
 
-OLLAMA_URL = "http://100.79.119.60:11434/api/generate"
-OLLAMA_MODEL = "gemma:2b"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma:2b")
 
 BATCH_SIZE = 300
 MAX_RETRIES = 3

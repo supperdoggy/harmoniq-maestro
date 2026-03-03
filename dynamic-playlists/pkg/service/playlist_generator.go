@@ -259,7 +259,7 @@ func (pg *PlaylistGenerator) matchesSimplifiedGenreFilter(query bson.M, simplifi
 	// Simple check - if simplified_genre is in query, check if it matches
 	if val, ok := query["simplified_genre"]; ok {
 		if expected, ok := val.(string); ok {
-			return strings.ToLower(expected) == strings.ToLower(simplifiedGenre)
+			return strings.EqualFold(expected, simplifiedGenre)
 		}
 	}
 	// If not explicitly filtered, allow all

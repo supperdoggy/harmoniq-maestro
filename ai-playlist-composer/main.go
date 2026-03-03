@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -16,15 +17,20 @@ import (
 )
 
 const (
-	mongoURI              = "mongodb://root:SssnI5NMth5OeedbPmbQ49DxEbT726@100.111.149.52:27017/"
+	defaultMongoURI       = "mongodb://localhost:27017/"
+	defaultOllamaURL      = "http://localhost:11434/api/generate"
 	dbName                = "music-services"
 	collectionName        = "music-files"
-	ollamaURL             = "http://100.79.119.60:11434/api/generate"
 	ollamaModel           = "tinyllama:1.1b"
 	batchSize             = 300
 	maxRetries            = 3
 	playlistItemsPerBatch = 5
 	totalTargetItems      = 50
+)
+
+var (
+	mongoURI  = getEnv("MONGO_URI", defaultMongoURI)
+	ollamaURL = getEnv("OLLAMA_URL", defaultOllamaURL)
 )
 
 type Song map[string]interface{}
@@ -38,6 +44,14 @@ type OllamaRequest struct {
 	Model    string    `json:"model"`
 	Stream   bool      `json:"stream"`
 	Messages []Message `json:"messages"`
+}
+
+func getEnv(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+
+	return fallback
 }
 
 func getAllSongs(ctx context.Context, client *mongo.Client) ([]Song, error) {
