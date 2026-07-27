@@ -3,6 +3,12 @@
 Worker service that reads queued Spotify requests from MongoDB and downloads
 content via `spotdl`.
 
+For an architecture, lifecycle, data-contract, and operational description of
+the component as it exists today, see
+[the current-state document](../docs/spotdl-wapper-current-state.md).
+For replacement options and a staged target architecture, see
+[the migration proposal](../docs/spotdl-wapper-migration.md).
+
 ## Features
 
 - Queue-based request processing
