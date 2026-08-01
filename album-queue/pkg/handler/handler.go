@@ -197,7 +197,9 @@ func (h *handler) HandleQueue(m *telebot.Message) {
 		return
 	}
 
-	// Update found track count for each request and save to database
+	// Refresh progress only in the local response snapshot. Queue rendering is
+	// read-only with respect to the durable job: the acquisition worker owns
+	// completion, lifecycle state, error flags, and its lease.
 	for i := range requests {
 		if requests[i].ExpectedTrackCount > 0 && len(requests[i].TrackMetadata) > 0 {
 			foundCount, err := h.compareTracks(ctx, requests[i])
@@ -205,23 +207,7 @@ func (h *handler) HandleQueue(m *telebot.Message) {
 				h.log.Error("Failed to compare tracks", zap.Error(err), zap.String("request_id", requests[i].ID))
 				continue
 			}
-			// Always update the count when /queue is called
 			requests[i].FoundTrackCount = foundCount
-			requests[i].UpdatedAt = time.Now().Unix()
-
-			// Mark as completed if all tracks are found
-			if foundCount == requests[i].ExpectedTrackCount && requests[i].Active {
-				requests[i].Active = false
-				h.log.Info("Marking request as completed",
-					zap.String("request_id", requests[i].ID),
-					zap.String("name", requests[i].Name),
-					zap.Int("found", foundCount),
-					zap.Int("expected", requests[i].ExpectedTrackCount))
-			}
-
-			if err := h.db.UpdateDownloadRequest(ctx, requests[i]); err != nil {
-				h.log.Error("Failed to update found track count", zap.Error(err))
-			}
 		}
 	}
 

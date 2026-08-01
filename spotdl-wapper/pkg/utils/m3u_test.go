@@ -1,67 +1,132 @@
 package utils
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func TestCreateM3UPlaylist(t *testing.T) {
-	tmpDir := t.TempDir()
-	outputPath := filepath.Join(tmpDir, "test.m3u")
+	libraryRoot := filepath.Join(t.TempDir(), "music")
+	outputPath := filepath.Join(libraryRoot, "playlists", "test.m3u")
 
 	paths := []string{
-		"/music/Artist1 - Song1.flac",
-		"/music/Artist2 - Song2.flac",
-		"/music/Artist3 - Song3.flac",
+		filepath.Join(libraryRoot, "downloads", "Artist1 - Song1.flac"),
+		filepath.Join("downloads", "Artist2 - Song2.flac"),
+		filepath.Join(libraryRoot, "Artist3 - Song3.flac"),
+	}
+	for _, path := range paths {
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(libraryRoot, path)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("audio"), 0o640); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	err := CreateM3UPlaylist(paths, tmpDir, outputPath)
+	err := CreateM3UPlaylist(paths, libraryRoot, outputPath)
 	if err != nil {
 		t.Fatalf("CreateM3UPlaylist failed: %v", err)
 	}
 
-	// Verify file was created
 	content, err := os.ReadFile(outputPath)
 	if err != nil {
 		t.Fatalf("failed to read output file: %v", err)
 	}
 
-	// Check content contains our paths
-	contentStr := string(content)
-	for _, path := range paths {
-		if !contains(contentStr, path) {
-			t.Errorf("expected path %s in playlist, not found", path)
-		}
+	want := strings.Join([]string{
+		filepath.ToSlash(filepath.Join(libraryRoot, "downloads", "Artist1 - Song1.flac")),
+		filepath.ToSlash(filepath.Join(libraryRoot, "downloads", "Artist2 - Song2.flac")),
+		filepath.ToSlash(filepath.Join(libraryRoot, "Artist3 - Song3.flac")),
+		"",
+	}, "\n")
+	if got := string(content); got != want {
+		t.Errorf("playlist content = %q, want %q", got, want)
+	}
+
+	parentInfo, err := os.Stat(filepath.Dir(outputPath))
+	if err != nil {
+		t.Fatalf("stat playlist directory: %v", err)
+	}
+	if parentInfo.Mode().Perm()&0o007 != 0 {
+		t.Errorf("playlist directory permissions = %o, want no world access", parentInfo.Mode().Perm())
+	}
+
+	fileInfo, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatalf("stat playlist: %v", err)
+	}
+	if got := fileInfo.Mode().Perm(); got != 0o640 {
+		t.Errorf("playlist permissions = %o, want 640", got)
 	}
 }
 
-func TestCreateM3UPlaylist_AlreadyExists(t *testing.T) {
-	tmpDir := t.TempDir()
-	outputPath := filepath.Join(tmpDir, "existing.m3u")
+func TestCreateM3UPlaylistAtomicallyReplacesExistingContent(t *testing.T) {
+	libraryRoot := filepath.Join(t.TempDir(), "music")
+	outputPath := filepath.Join(libraryRoot, "playlists", "existing.m3u")
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o750); err != nil {
+		t.Fatalf("create playlist directory: %v", err)
+	}
 
-	// Create existing file
-	if err := os.WriteFile(outputPath, []byte("existing"), 0644); err != nil {
+	if err := os.WriteFile(outputPath, []byte("stale\ncontent\n"), 0o640); err != nil {
 		t.Fatalf("failed to create existing file: %v", err)
 	}
 
-	paths := []string{"/music/test.flac"}
-	err := CreateM3UPlaylist(paths, tmpDir, outputPath)
-	if err != os.ErrExist {
-		t.Errorf("expected ErrExist, got %v", err)
+	path := filepath.Join(libraryRoot, "downloads", "current.flac")
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("audio"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := CreateM3UPlaylist(
+			[]string{path},
+			libraryRoot,
+			outputPath,
+		); err != nil {
+			t.Fatalf("CreateM3UPlaylist attempt %d failed: %v", attempt+1, err)
+		}
+	}
+
+	content, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read replaced playlist: %v", err)
+	}
+	want := filepath.ToSlash(path) + "\n"
+	if got := string(content); got != want {
+		t.Errorf("playlist content = %q, want %q", got, want)
+	}
+
+	entries, err := os.ReadDir(filepath.Dir(outputPath))
+	if err != nil {
+		t.Fatalf("read playlist directory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(outputPath) {
+		t.Errorf("playlist directory contains temporary files: %#v", entries)
 	}
 }
 
-func TestCreateM3UPlaylist_EmptyPaths(t *testing.T) {
-	tmpDir := t.TempDir()
-	outputPath := filepath.Join(tmpDir, "empty.m3u")
+func TestCreateM3UPlaylistEmptyPathsReplacesWithEmptyFile(t *testing.T) {
+	libraryRoot := filepath.Join(t.TempDir(), "music")
+	outputPath := filepath.Join(libraryRoot, "playlists", "empty.m3u")
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o750); err != nil {
+		t.Fatalf("create playlist directory: %v", err)
+	}
+	if err := os.WriteFile(outputPath, []byte("old content\n"), 0o640); err != nil {
+		t.Fatalf("create old playlist: %v", err)
+	}
 
-	err := CreateM3UPlaylist([]string{}, tmpDir, outputPath)
+	err := CreateM3UPlaylist([]string{}, libraryRoot, outputPath)
 	if err != nil {
 		t.Fatalf("CreateM3UPlaylist failed for empty paths: %v", err)
 	}
 
-	// File should exist but be empty
 	content, err := os.ReadFile(outputPath)
 	if err != nil {
 		t.Fatalf("failed to read output file: %v", err)
@@ -69,6 +134,125 @@ func TestCreateM3UPlaylist_EmptyPaths(t *testing.T) {
 
 	if len(content) != 0 {
 		t.Errorf("expected empty file, got %d bytes", len(content))
+	}
+}
+
+func TestCreateM3UPlaylistRejectsEscapingPathBeforeReplacing(t *testing.T) {
+	base := t.TempDir()
+	libraryRoot := filepath.Join(base, "music")
+	outputPath := filepath.Join(libraryRoot, "playlists", "safe.m3u")
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o750); err != nil {
+		t.Fatalf("create playlist directory: %v", err)
+	}
+	const original = "known-good\n"
+	if err := os.WriteFile(outputPath, []byte(original), 0o640); err != nil {
+		t.Fatalf("create existing playlist: %v", err)
+	}
+
+	unsafePaths := []string{
+		filepath.Join(base, "music-other", "song.flac"),
+		filepath.Join("..", "outside.flac"),
+	}
+	for _, unsafePath := range unsafePaths {
+		err := CreateM3UPlaylist(
+			[]string{unsafePath},
+			libraryRoot,
+			outputPath,
+		)
+		if !errors.Is(err, ErrPathOutsideLibrary) {
+			t.Errorf(
+				"CreateM3UPlaylist(%q) error = %v, want ErrPathOutsideLibrary",
+				unsafePath,
+				err,
+			)
+		}
+	}
+
+	content, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read original playlist: %v", err)
+	}
+	if got := string(content); got != original {
+		t.Errorf("unsafe update changed playlist to %q", got)
+	}
+}
+
+func TestCreateM3UPlaylistRejectsLineInjection(t *testing.T) {
+	libraryRoot := filepath.Join(t.TempDir(), "music")
+	outputPath := filepath.Join(libraryRoot, "playlists", "safe.m3u")
+	err := CreateM3UPlaylist(
+		[]string{"downloads/song.flac\n/malicious.flac"},
+		libraryRoot,
+		outputPath,
+	)
+	if err == nil {
+		t.Fatal("CreateM3UPlaylist accepted a path containing a newline")
+	}
+	if _, statErr := os.Stat(outputPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("unsafe update created output; stat error = %v", statErr)
+	}
+}
+
+func TestCreateM3UPlaylistRejectsSymlinkEscape(t *testing.T) {
+	base := t.TempDir()
+	libraryRoot := filepath.Join(base, "music")
+	outsideRoot := filepath.Join(base, "outside")
+	if err := os.MkdirAll(libraryRoot, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outsideRoot, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outsideRoot, "song.flac")
+	if err := os.WriteFile(outsideFile, []byte("audio"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideRoot, filepath.Join(libraryRoot, "escaped")); err != nil {
+		t.Skipf("symbolic links are unavailable: %v", err)
+	}
+
+	err := CreateM3UPlaylist(
+		[]string{filepath.Join(libraryRoot, "escaped", "song.flac")},
+		libraryRoot,
+		filepath.Join(libraryRoot, "playlists", "safe.m3u"),
+	)
+	if !errors.Is(err, ErrPathOutsideLibrary) {
+		t.Fatalf("CreateM3UPlaylist() error = %v, want ErrPathOutsideLibrary", err)
+	}
+}
+
+func TestSanitizePlaylistName(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "plain", input: "Road Trip", want: "Road Trip"},
+		{name: "separators", input: `AC/DC \ Live`, want: "AC-DC-Live"},
+		{name: "traversal", input: "../../private", want: "private"},
+		{name: "control", input: "Morning\nMix\t2026", want: "Morning-Mix-2026"},
+		{name: "reserved", input: "CON", want: "_CON"},
+		{name: "empty", input: `<>:"/\|?*`, want: "playlist"},
+		{name: "unicode", input: "Česká hudba 🎵", want: "Česká hudba 🎵"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := SanitizePlaylistName(test.input); got != test.want {
+				t.Errorf("SanitizePlaylistName(%q) = %q, want %q", test.input, got, test.want)
+			}
+		})
+	}
+}
+
+func TestSanitizePlaylistNameLimitsUTF8Length(t *testing.T) {
+	name := strings.Repeat("🎵", 100)
+	got := SanitizePlaylistName(name)
+	if len(got) > maxPlaylistNameBytes {
+		t.Fatalf("sanitized name has %d bytes, want at most %d", len(got), maxPlaylistNameBytes)
+	}
+	if !strings.HasPrefix(name, got) {
+		t.Errorf("sanitized Unicode name was corrupted: %q", got)
 	}
 }
 
@@ -104,6 +288,15 @@ func TestFindUnindexedSongs(t *testing.T) {
 	if len(matched) != 2 {
 		t.Errorf("expected 2 matched songs, got %d", len(matched))
 	}
+	want := []string{
+		filepath.ToSlash(filepath.Join(musicDir, testFiles[0])),
+		filepath.ToSlash(filepath.Join(musicDir, testFiles[1])),
+	}
+	for i := range want {
+		if matched[i] != want[i] {
+			t.Errorf("matched[%d] = %q, want %q", i, matched[i], want[i])
+		}
+	}
 }
 
 func TestFindUnindexedSongs_InvalidFormat(t *testing.T) {
@@ -137,18 +330,4 @@ func TestPlaylistTrack_Fields(t *testing.T) {
 	if track.Duration != 180 {
 		t.Errorf("expected Duration 180, got %d", track.Duration)
 	}
-}
-
-// Helper function
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
-}
-
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

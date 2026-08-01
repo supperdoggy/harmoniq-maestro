@@ -78,7 +78,13 @@ func main() {
 	svc := service.NewService(database, playlistGenerator, openAIClient, logger)
 
 	// Initialize Spotify service for subscribed playlists
-	spotifyService := spotify.NewSpotifyService(ctx, cfg.SpotifyClientID, cfg.SpotifyClientSecret, logger)
+	spotifyService := spotify.NewSpotifyServiceWithRefreshToken(
+		ctx,
+		cfg.SpotifyClientID,
+		cfg.SpotifyClientSecret,
+		cfg.SpotifyRefreshToken,
+		logger,
+	)
 
 	// Initialize subscribed playlists processor
 	subscribedPlaylistsProcessor := service.NewSubscribedPlaylistsProcessor(

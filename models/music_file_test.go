@@ -8,12 +8,21 @@ import (
 
 func TestMusicFile_JSON(t *testing.T) {
 	file := MusicFile{
-		ID:     "file-id-789",
-		Artist: "Test Artist",
-		Album:  "Test Album",
-		Title:  "Test Song",
-		Genre:  "Electronic",
-		Path:   "/music/test.flac",
+		ID:             "file-id-789",
+		Artist:         "Test Artist",
+		Album:          "Test Album",
+		Title:          "Test Song",
+		Genre:          "Electronic",
+		Path:           "/music/test.flac",
+		SpotifyID:      "spotify-track-id",
+		SpotifyURL:     "https://open.spotify.com/track/spotify-track-id",
+		ISRC:           "USRC17607839",
+		DurationMS:     180000,
+		SourceProvider: "youtube",
+		SourceID:       "video-id",
+		MatchScore:     0.97,
+		Checksum:       "sha256:test",
+		Format:         "flac",
 		MetaData: map[string]any{
 			"bitrate":     320,
 			"duration":    180,
@@ -38,6 +47,15 @@ func TestMusicFile_JSON(t *testing.T) {
 	}
 	if decoded.Path != file.Path {
 		t.Errorf("Path mismatch: got %s, want %s", decoded.Path, file.Path)
+	}
+	if decoded.SpotifyID != file.SpotifyID {
+		t.Errorf("SpotifyID mismatch: got %s, want %s", decoded.SpotifyID, file.SpotifyID)
+	}
+	if decoded.SourceID != file.SourceID {
+		t.Errorf("SourceID mismatch: got %s, want %s", decoded.SourceID, file.SourceID)
+	}
+	if decoded.Checksum != file.Checksum {
+		t.Errorf("Checksum mismatch: got %s, want %s", decoded.Checksum, file.Checksum)
 	}
 	if decoded.MetaData["bitrate"] != float64(320) { // JSON numbers are float64
 		t.Errorf("MetaData bitrate mismatch: got %v", decoded.MetaData["bitrate"])

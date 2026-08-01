@@ -1,440 +1,623 @@
 # `spotdl-wapper`: current state
 
-This document describes the component as it exists today. It is intentionally
-an as-is reference, not a proposal for its replacement.
+This document describes the integrated implementation in the repository as of
+2026-07-28. It is an as-built reference, not a description of the pre-migration
+wrapper.
 
-Snapshot reviewed on 2026-07-27 on branch `easy-start` at commit
-`a1a761943bec35adb75ac7b57570417b671db728`.
+The repository and Compose service retain the historical name
+`spotdl-wapper`. Some log labels use `spotdl-wrapper`.
 
-The repository and Compose service use the name `spotdl-wapper`. Some log labels
-use `spotdl-wrapper`; this document uses the repository name.
+## Executive summary
 
-## Role in the system
+`spotdl-wapper` is now a long-running, provider-neutral acquisition worker. It
+atomically claims MongoDB jobs, resolves Spotify objects to track metadata,
+acquires each track through one explicitly configured provider, validates and
+tags the result, publishes it into the library, and synchronously upserts the
+`music-files` catalog.
 
-`spotdl-wapper` is a one-shot Go worker around the `spotdl` command-line
-program. It does considerably more than launch the downloader:
+Two acquisition providers are integrated:
 
-- reads download and playlist work from MongoDB;
-- expands Spotify albums and playlists into track metadata;
-- invokes `spotdl` for bulk or per-track downloads;
-- tracks request, retry, and per-track progress;
-- reconciles downloaded tracks against the `music-files` collection;
-- coordinates with an external filesystem indexer through `index-status`;
-- creates M3U files for one-off playlist requests;
-- writes console logs and can also ship them to Loki.
+- `spotdl` is the default compatibility and rollback backend;
+- direct `yt-dlp` is an explicit opt-in backend with wrapper-owned candidate
+  search and conservative matching.
 
-The actual audio lookup, download, conversion, and tag writing are delegated to
-`spotdl`, `yt-dlp`, and FFmpeg.
+There is no automatic provider fallback. A process constructs exactly one
+provider. The first successful claim atomically pins an unassigned request to
+that provider, and retries/reclaims remain pinned to it. Two differently
+configured workers can therefore coexist without cross-provider retry drift,
+but whichever worker wins an unassigned request determines its backend. There
+is no producer cohort-routing or operator re-route API yet.
+
+The previous one-shot lifecycle, bulk spotDL branch, post-download indexer
+handshake, and catalog-lag-as-download-failure behavior are no longer part of
+the active download path. Legacy models and some unused indexer methods remain
+for compatibility.
 
 ## System context
 
 ```mermaid
 flowchart LR
-    user["Telegram user"] --> queue["album-queue"]
-    queue --> downloads[("download-queue-requests")]
-    queue --> playlists[("playlist-requests")]
-    dynamic["dynamic-playlists"] --> downloads
+    producers["album-queue / dynamic-playlists"] --> jobs[("download-queue-requests")]
+    playlistProducer["album-queue"] --> playlistJobs[("playlist-requests")]
 
-    downloads --> worker["spotdl-wapper"]
-    playlists --> worker
+    jobs --> worker["spotdl-wapper coordinator"]
+    playlistJobs --> worker
     worker --> spotify["Spotify Web API"]
-    worker --> spotdl["spotdl CLI"]
-    spotdl --> files[("mounted music library")]
 
-    files --> indexer["external music-files indexer"]
-    indexer --> catalog[("music-files")]
-    indexer --> status[("index-status")]
-    worker --> catalog
-    worker --> status
-    worker --> m3u["M3U files"]
+    worker --> provider{"configured provider"}
+    provider -->|default| spotdl["spotDL"]
+    provider -->|explicit opt-in| ytdlp["direct yt-dlp"]
+    spotdl --> staging[("staging directory")]
+    ytdlp --> staging
+
+    staging --> importer["FFmpeg tag + FFprobe validation"]
+    importer --> files[("music library")]
+    importer --> catalog[("music-files")]
+    catalog --> materializer["one-off playlist materializer"]
+    materializer --> m3u["M3U files"]
 ```
 
-There is no HTTP or RPC call into the worker. Producers insert MongoDB
-documents, and the worker discovers them on its next pass.
+There is no HTTP endpoint on the worker. Producers write MongoDB documents,
+and the process polls for eligible work. `album-queue` now treats the worker as
+the lifecycle owner: rendering the queue may calculate a local progress
+snapshot, but it does not mark a request complete.
 
-### Producers and competing state owners
+`dynamic-playlists` still has a separate subscribed/dynamic playlist workflow
+and its own M3U generation. One-off `playlist-requests` remain in this worker.
 
-- `album-queue` is the primary producer. It normally resolves the Spotify
-  object name, type, expected count, and track metadata before inserting a
-  request. Its `/queue` read path also reconciles against `music-files` and can
-  mark a request inactive, so the worker is not the only completion writer.
-- `dynamic-playlists` creates one-track download requests for missing
-  subscribed-playlist entries. It also owns a second M3U implementation.
-- `spotdl-wapper` creates more one-track requests while processing legacy
-  `playlist-requests`. Because downloads run before playlist requests, those
-  new jobs wait for the next container restart.
+## Runtime lifecycle
 
-The `album-queue` webhook does not wake this worker. It is a plain HTTP GET, and
-the example configuration points it at `album-queue`'s own health endpoint.
-
-### Downstream consumers
-
-The migration surface extends beyond the three core services:
-
-- `album-queue` displays and mutates queue progress and failure state;
-- `dynamic-playlists` reads `music-files` paths and inactive request history;
-- experimental `album-normalizer`, playlist composers, and `deduplicator`
-  consume the indexed catalog, tags, files, or generated M3Us.
-
-Changing tags, filesystem layout, `MusicFile.Path`, or the meaning of inactive
-queue history therefore requires a compatibility or data-migration plan.
-
-## Process lifecycle
-
-The lifecycle is defined by
+The process lifecycle is defined by
 [`main.go`](../spotdl-wapper/main.go) and
 [`service.go`](../spotdl-wapper/pkg/service/service.go):
 
-1. Load required environment variables.
-2. Build the console/Loki logger.
-3. Construct the shared Spotify metadata client.
-4. Connect a MongoDB client.
-5. Process all active download requests sequentially.
-6. Process all active one-off playlist requests sequentially.
-7. Return from the processing pass, wait five seconds, and exit.
+1. Validate configuration before constructing the logger.
+2. Create a signal-aware context for `SIGINT` and `SIGTERM`.
+3. Create the Spotify client, connect to and ping MongoDB, and attempt index
+   creation.
+4. Construct exactly one acquisition provider plus the shared importer.
+5. Before each processing pass, remove expired private provider-attempt
+   directories from staging.
+6. Immediately drain currently eligible download work.
+7. Process active one-off playlist requests.
+8. Wait for the poll ticker and repeat.
+9. On shutdown, cancel in-flight work, release an interrupted claim when
+   possible, close MongoDB, stop Loki delivery, and flush the logger.
 
-The worker does not contain a polling loop. In the supported Compose setup,
-`restart: unless-stopped` restarts the successfully exited container, which
-turns repeated process launches into polling. Running the binary directly
-performs one pass only.
+`SLEEP_IN_MINUTES` is now only a legacy throttle between claimed download
+requests in one drain. It does not delay the first request. Work created while
+playlist processing is running is picked up by the next poll.
 
-The Compose service has no health check or readiness endpoint. Graceful signal
-handling and MongoDB disconnection are also not implemented.
+`WORKER_POLL_INTERVAL` is the cadence of a ticker created before the first
+processing pass, not a guaranteed delay after a pass completes. If a pass runs
+longer than the interval, a queued tick can make the next pass start
+immediately. Download work is drained before playlists on every pass, so a
+continuously replenished download queue can starve one-off playlist work.
 
-## Download processing
+Downloader and FFmpeg/FFprobe commands receive a context and a timeout. They
+are executed with direct argument arrays rather than a shell. On Linux and
+Darwin, cancellation targets the subprocess process group so child FFmpeg
+processes do not outlive the worker. Captured diagnostics are bounded before
+being attached to errors.
+
+Compose still uses `restart: unless-stopped`, but restart is no longer the
+polling mechanism. There is no worker health or readiness endpoint.
+
+## Download workflow
 
 Download processing is implemented in
 [`download_requests.go`](../spotdl-wapper/pkg/service/download_requests.go).
+Every Spotify track, album, or playlist request follows the same per-track
+pipeline.
 
-### Request selection and ordering
+### Claim and metadata resolution
 
-The worker loads every document where `active` is `true`, sorts non-errored
-requests before errored requests and then by `created_at`, and handles them one
-at a time. It sleeps for `SLEEP_IN_MINUTES` before every request, including the
-first request in a pass.
+The worker claims one eligible document with MongoDB `FindOneAndUpdate`. The
+claim sets:
 
-Requests are read and later updated in separate operations. There is no atomic
-claim, lease, or worker identity, so more than one worker can process the same
-request.
+- `state=claimed`;
+- `worker_id`;
+- a cryptographically random `claim_id`;
+- `lease_expires_at`;
+- `backend` to the configured provider, assigning it when previously empty;
+- `active=true`.
 
-### Metadata expansion
+Selection preserves the legacy preference for non-errored work, then sorts by
+`created_at` and `_id`. Legacy active documents with missing/empty state are
+treated as pending. An expired lease makes an unfinished job reclaimable.
+The claim filter accepts only an empty backend or the worker's configured
+backend. First claim therefore creates durable provider affinity, and a retry
+or lease reclaim cannot silently move to the other provider. Assignment of a
+previously unassigned request is still nondeterministic when differently
+configured workers race for it.
 
-If a request has no expected count or track metadata, the worker calls the
-shared Spotify service to populate them. The same service determines whether a
-URL refers to a track, album, playlist, or artist.
+Once processing starts, the worker renews the lease every one-third of
+`WORKER_LEASE_DURATION`, clamped to an interval between one and 30 seconds.
+Configuration rejects lease durations below three seconds.
+Every owner mutation requires the same worker ID, the current random claim ID,
+and an unexpired lease. The claim ID fences a stale processing attempt even if
+the same worker ID later reclaims the document. If renewal fails, the worker
+cancels the command/import context and stops acting as the owner.
 
-The persisted per-track identity consists of:
+If `track_metadata` is absent, the worker resolves the Spotify URL and persists
+canonical metadata for each usable track:
 
-- Spotify URL;
-- normalized artist string;
-- normalized title;
-- `found`, `skipped`, and `failed_attempts` progress fields.
+- Spotify URL and ID;
+- normalized artist, title, and album;
+- ISRC when supplied by Spotify;
+- duration, explicit flag, and detected version marker;
+- per-track progress and acquisition provenance fields.
 
-ISRC, duration, album identity, source candidate, and final filesystem path are
-not persisted in the queue document.
+Null, local, unplayable, empty-ID, or non-track playlist items are filtered
+out, and `expected_track_count` is set to the usable metadata count. Track,
+album, and playlist URLs are supported by the metadata expansion path.
+Although the URL parser recognizes artist URLs, acquisition of an artist URL
+is not supported.
 
-### Downloader branches
+Before acquiring anything, the worker prechecks the catalog by Spotify ID,
+then ISRC, then a case-insensitive artist/title fallback only for legacy
+records that have neither stable identity. A match counts only when its path is
+a readable, non-empty regular file contained within the library root; if the
+catalog has a checksum, the on-disk checksum must also match. Invalid or stale
+catalog rows do not cause the track to be skipped.
 
-Playlist requests with track metadata are pre-checked against `music-files` and
-downloaded one track at a time. Other requests, including albums and individual
-tracks, use one bulk command.
+### Per-track acquisition
 
-The current bulk invocation is equivalent to:
+For each track not already found, the worker:
+
+1. transitions the request to `resolving`;
+2. asks the configured provider for acceptable candidates;
+3. chooses the first candidate returned by that provider;
+4. transitions to `downloading` and acquires a staged file;
+5. transitions to `validating` and invokes the shared importer;
+6. records the published path/checksum and provenance as an `imported` recovery
+   journal before catalog mutation;
+7. explicitly renews the lease and upserts the returned `MusicFile`;
+8. marks the track found, stores the returned catalog ID, and persists the
+   cataloged checkpoint.
+
+Progress is persisted after every successful import. If a later track fails,
+earlier imports stay cataloged and marked found; a retry skips them. The request
+is `completed` only when every usable track is found. If catalog upsert fails
+after the recovery journal, a retry revalidates that exact published
+path/checksum and resumes cataloging without resolving, downloading, or tagging
+the track again.
+
+The request-level `result` contains the most recently imported artifact.
+Multi-track provenance is therefore authoritative in `track_metadata[]`, not
+in the single request-level result. While a journaled catalog upsert is pending,
+the result has the published path/checksum but no catalog ID.
+
+### spotDL compatibility provider
+
+The default provider is implemented in
+[`spotdl.go`](../spotdl-wapper/pkg/acquisition/spotdl.go).
+
+Resolution returns the canonical Spotify track URL as one synthetic,
+score-`0`/unscored candidate. spotDL still owns its internal media-source
+lookup and matching, so the wrapper cannot report confidence comparable to a
+direct yt-dlp score or identify spotDL's actual media source.
+
+Each acquisition uses a private attempt directory beneath staging:
 
 ```text
-spotdl <spotify-url> \
-  --output <DESTINATION> \
-  --config \
-  --no-cache \
-  --sync-without-deleting
+<ACQUISITION_STAGING_PATH>/.harmoniq-attempt-<spotify-or-derived-id>-<random>/
+  <spotify-or-derived-id>.<format>
 ```
 
-The current per-track invocation omits `--sync-without-deleting`:
+The command receives an output template ending in `{output-ext}` and the
+adapter verifies the expected configured-format result:
 
 ```text
 spotdl <spotify-track-url> \
-  --output <DESTINATION> \
-  --config \
+  --output <private-attempt-path>/<safe-id>.{output-ext} \
+  --format <ACQUISITION_AUDIO_FORMAT> \
+  [--config] \
   --no-cache
 ```
 
-Despite comments in the source referring to `spotdl --sync`, neither command
-passes the `sync` operation.
+`SPOTDL_USE_CONFIG=true` adds spotDL's boolean `--config` flag. spotDL discovers
+the file in its standard config locations; no config pathname is passed to the
+CLI. There is no bulk request branch and no `--sync-without-deleting`
+behavior.
 
-Standard output and standard error are scanned line by line and written as
-structured log messages. The worker uses `exec.Command`, not
-`exec.CommandContext`, so request cancellation does not stop the subprocess and
-there is no per-download timeout. Linux builds set a parent-death signal so the
-child is killed if the worker process itself dies.
+### Direct yt-dlp provider
 
-### Completion semantics
+The direct provider in
+[`ytdlp.go`](../spotdl-wapper/pkg/acquisition/ytdlp.go) is used only when
+`ACQUISITION_BACKEND=yt-dlp`.
 
-A zero exit status from `spotdl` is not sufficient to mark a track as found.
-The worker queries `music-files` and performs a case-insensitive exact match on
-artist and title. This makes the external indexer part of the download
-completion path.
+Resolution runs a bounded `ytsearchN` query built from artists, title, version,
+and `audio`, then parses `--dump-single-json --flat-playlist` output. Candidates
+are scored with:
 
-A request is deactivated when either:
+| Signal | Weight |
+| --- | ---: |
+| Title token coverage | 60% |
+| Artist token coverage | 20% |
+| Duration similarity | 15% |
+| Version-marker agreement | 5% |
 
-- every track is `found` or `skipped`; or
-- `sync_count` reaches three.
+Candidates are hard-rejected when title similarity is below `0.75`, artist
+similarity is below `0.5`, known durations differ by more than 30 seconds, or a
+strict variant is unexpectedly present or missing. Strict variants are live,
+remix, cover/tribute/karaoke, nightcore, slowed, and sped-up. Acoustic,
+instrumental, remaster, demo, and edit markers affect the score but are not
+hard rejections.
 
-For playlist downloads, a failed subprocess increments a track's failed-attempt
-count, and the final catalog reconciliation can increment it again while the
-file is still absent from `music-files`. A track is skipped after three failed
-attempts. Individual track failures are logged but are not returned as a
-request-level error by the playlist branch.
+Remaining candidates below `YTDLP_MINIMUM_SCORE` are dropped and the
+highest-scoring candidate is selected. No acceptable candidate produces
+`needs_review`; the worker does not silently fall back to spotDL.
 
-The result is an at-most-three-pass policy, not an assurance that every
-requested track was downloaded.
+Acquisition requests audio extraction, reads the final path from yt-dlp's
+`after_move:filepath` machine output, and confines the result to a private
+attempt directory under staging. It returns a structured provider/source
+result. Search reasons exist on the in-memory candidate but are not currently
+stored in MongoDB.
 
-## Indexing handshake
+Both providers support only `mp3`, `flac`, `ogg`, `opus`, `m4a`, and `wav`.
+For yt-dlp, `ogg` selects its `vorbis` audio format. A configured
+`YTDLP_MINIMUM_SCORE=0` is honored; hard rejection rules still apply.
 
-The worker reads and writes a singleton-like document in `index-status`:
+> **Authorized content only:** direct yt-dlp acquisition must only be used for
+> content the operator is permitted to download. This implementation choice
+> does not grant rights to third-party media or override service terms.
 
-- after processing downloads, it sets `last_updated` to the current time;
-- playlist processing is deferred while `last_updated > last_indexed`;
-- an external indexer is expected to scan the filesystem, populate
-  `music-files`, and advance `last_indexed`.
+## Validation, tagging, and import
 
-The tracked repository does not contain or run that indexer. A local
-`music-files-indexer` directory may appear in a developer checkout, but the root
-`.gitignore` pattern `**/*-indexer` ignores the directory and all of its
-contents. It is absent from `go.work`, the root Makefile, CI, and
-`docker-compose.yml`.
+The shared importer is implemented in
+[`importer.go`](../spotdl-wapper/pkg/library/importer.go). It is the authority
+for converting a provider result into a catalog item:
 
-There is no initialization/upsert path for `index-status`; a clean database
-without a status document causes both the post-download status update and
-playlist gate to fail.
+1. Require the provider path to be a non-empty regular, non-symlink file in a
+   marked private attempt directory directly beneath
+   `ACQUISITION_STAGING_PATH`; validate resolved containment and verify the
+   provider-supplied checksum when present.
+2. Expand `MEDIA_OUTPUT_TEMPLATE` and reject a final path outside
+   `MUSIC_LIBRARY_PATH`. Staging and library roots must differ, and the media
+   template cannot point into staging.
+3. Run FFmpeg into a temporary file beside the final destination, stream-copying
+   the selected audio and adding canonical title, artist, album, ISRC, Spotify
+   ID, and source/Spotify URL metadata. Embedded artwork is also preserved for
+   `mp3`, `flac`, and `m4a`; other configured formats omit video streams.
+   Bit-exact muxing flags make repeated tagging checksum-stable, including OGG
+   and Opus containers.
+4. Run FFprobe and require a readable audio stream and positive duration.
+5. Enforce a duration tolerance equal to the larger of the configured
+   tolerance and 5% of the expected Spotify duration.
+6. Calculate the final tagged-file SHA-256 checksum, set mode `0640`, and sync
+   the temporary file.
+7. Try deterministic destination candidates: the desired path, an
+   identity-suffixed path, a short-checksum path, and a full-checksum path.
+   Identical existing content is reused; exhausting distinct collision
+   candidates sends the request to review.
+8. Publish with an atomic hard-link operation, sync the destination directory
+   for a new file, and remove the staged source only after the final path
+   exists.
+9. Return a canonical `MusicFile`; the coordinator journals it, renews its
+   lease, upserts `music-files`, and uses the stored catalog document's ID in
+   the request result.
 
-`IndexDownloadedFiles` in
-[`indexation.go`](../spotdl-wapper/pkg/service/indexation.go) is unused and does
-not provide the missing integration.
+Supported final-template placeholders are `{artists}`, `{artist}`, `{title}`,
+`{album}`, `{spotify-id}`, and `{output-ext}`. Metadata components are
+sanitized, and the fully expanded result must remain inside the library root.
+Oversized filename and directory components are UTF-8-safely truncated with a
+deterministic hash suffix; filenames reserve headroom for collision suffixes
+and remain below filesystem component-length limits.
 
-## One-off playlist processing
+The importer provides atomic visibility of a completed file, but MongoDB and
+the filesystem are not one transaction. The recovery journal closes the normal
+catalog-failure window. A process/host crash in the smaller interval after
+publication but before the journal write can still leave an uncataloged file
+until reacquisition or external reconciliation.
 
-One-off M3U requests are implemented in
-[`playlist_requests.go`](../spotdl-wapper/pkg/service/playlist_requests.go):
+After acquisition, a failure before the importer successfully consumes the
+asset invokes its discard path. Discard repeats marked ownership, resolved
+containment, and no-symlink validation before removing the staged file and its
+now-empty attempt directory. Once import succeeds, the source has already been
+consumed. The worker journals the published artifact next; subsequent catalog
+failures resume from it, while failure before that journal is durable leaves
+the small reconciliation boundary described above. Before every processing
+pass, staging cleanup removes marked `.harmoniq-attempt-*` directories older
+than twice the larger of
+`ACQUISITION_COMMAND_TIMEOUT` and `WORKER_LEASE_DURATION`. It intentionally
+does not delete direct files or symlinks in staging. This cleanup addresses
+abandoned provider attempts, not the publish-before-journal window in the final
+library.
 
-1. Wait for the index-status handshake to indicate indexing is caught up.
-2. Fetch the current Spotify playlist name and tracks.
-3. Match tracks against `music-files`.
-4. Unless `no_pull` is set, enqueue a download request for each missing track.
-5. Return a retryable `missing files` error if new download work was created.
-6. Create an M3U from the paths currently present in the catalog.
-7. Deactivate the playlist request on success or after five failed passes.
-
-`DESTINATION` has two incompatible uses:
-
-- it is passed to `spotdl` as an output filename template; and
-- it is concatenated with `/Playlists/<name>.m3u` as if it were a directory.
-
-With the documented example
-`/music/downloads/{artists}-{title}.{output-ext}`, the derived M3U path is not a
-valid playlist directory. This code also does not create the parent directory
-and refuses to replace an existing M3U. `MUSIC_LIBRARY_PATH` is passed to the
-M3U helper but ignored; the caller instead hard-codes a `/mnt/music` to `/music`
-path rewrite.
-
-Subscribed Spotify playlists are handled separately by `dynamic-playlists`,
-which contains another playlist-to-library matching and M3U implementation.
-
-## MongoDB contracts
-
-### `download-queue-requests`
+## Durable request states
 
 The shared model is
 [`DownloadQueueRequest`](../models/download_request.go).
 
-| Field group | Current meaning |
-| --- | --- |
-| Identity | `_id`, `creator_id`, `spotify_url`, `object_type`, `name` |
-| Request state | `active`, `errored`, `created_at`, `updated_at` |
-| Retry state | `sync_count`, `retry_count` |
-| Progress | `expected_track_count`, `found_track_count`, `track_metadata[]` |
+| State | Meaning | Automatically claimable |
+| --- | --- | --- |
+| `pending` | New producer-created work | Yes |
+| `claimed` | Owned under a lease | After lease expiry |
+| `resolving` | Metadata or candidate resolution | After lease expiry |
+| `downloading` | Provider command in progress | After lease expiry |
+| `validating` | Import validation/tagging in progress | After lease expiry |
+| `imported` | A published artifact is journaled; its catalog upsert may be pending or complete | After lease expiry |
+| `completed` | Every usable track is found | No |
+| `retry_wait` | Retryable error scheduled for `next_attempt_at` | At/after schedule |
+| `needs_review` | Non-retryable ambiguity or operator action required | No |
+| `failed` | Retry budget exhausted | No |
+| `cancelled` | Explicitly cancelled | No |
 
-Documents are created by `album-queue`, `dynamic-playlists`, and
-`spotdl-wapper` itself when a playlist is missing individual tracks.
-`spotdl-wapper` is the main state-transition owner, but the `/queue` read path
-in `album-queue` also reconciles tracks and can mark a request inactive.
+`completed`, `failed`, and `cancelled` are model-terminal. `needs_review` is
+operationally paused even though it is not reported as terminal by
+`IsTerminal`; there is no built-in review/resume UI yet.
 
-### `playlist-requests`
+The worker dual-writes legacy flags:
 
-The shared model is
-[`PlaylistRequest`](../models/download_request.go). It represents a one-off M3U
-request and stores the Spotify URL, creator, active/error/retry state, and the
-`no_pull` flag.
+- active processing states use `active=true, errored=false`;
+- `retry_wait` and `needs_review` use `active=true, errored=true`;
+- `completed` uses `active=false, errored=false`;
+- `failed` uses `active=false, errored=true`;
+- `cancelled` uses `active=false, errored=false`.
+
+This keeps older readers usable while making `state` authoritative.
+
+### Retry classification
+
+Each claim increments `sync_count`. Retryable metadata, resolution, download,
+and pre-publication import failures increment `retry_count`; after
+`WORKER_MAX_ATTEMPTS`, the request becomes `failed`. Otherwise it enters
+`retry_wait` until `WORKER_RETRY_DELAY` has passed.
+
+Catalog-finalization failures after publication are deliberately different.
+The recovery journal preserves the exact path/checksum, so journal persistence,
+lease renewal, catalog upsert, or catalog-result persistence failures enter
+`retry_wait` with the same backoff without incrementing `retry_count`. They can
+therefore continue beyond `WORKER_MAX_ATTEMPTS` rather than strand a valid
+published artifact.
+
+Spotify errors receive special handling:
+
+- `429` is retryable; the direct playlist-items request honors `Retry-After`
+  when it is longer than the configured delay;
+- `401` and `403` move to `needs_review`;
+- `400` and `404` move to `needs_review`;
+- `5xx` errors retry;
+- other classified `4xx` errors require review.
+
+Errors returned by the Spotify SDK are normalized to the same status-carrying
+API error type, so status classification applies consistently, but the SDK
+error does not expose `Retry-After`. No acceptable candidate, legacy skipped
+tracks, missing canonical track URLs, invalid assets, unsafe output paths,
+provider-checksum mismatches, publish collisions, and duration mismatches also
+require review. Provider execution and pre-publication persistence errors are
+retryable and budget-consuming; published-artifact catalog finalization is
+retryable but preserves the budget. Cancellation schedules immediate retry
+without consuming the retry budget.
+
+The current attempt budget is request-wide rather than independently budgeted
+per metadata, resolution, download, and validation stage. Catalog finalization
+is excluded from that budget as described above.
+
+## MongoDB contracts and indexes
+
+### `download-queue-requests`
+
+The collection stores request identity, legacy flags, explicit state, owner,
+random claim fence and lease, retry schedule, pinned backend, typed
+`last_error`, the most recent structured result, aggregate progress, and
+canonical per-track metadata/provenance.
+
+New requests created by `album-queue`, `dynamic-playlists`, or playlist
+materialization start in `pending`. Duplicate suppression treats pending,
+in-flight, retrying, review, and completed stateful requests as already synced.
+Failed and cancelled requests may be intentionally submitted again. Legacy
+documents remain subject to legacy active/success flags.
 
 ### `music-files`
 
-Each [`MusicFile`](../models/music_file.go) stores normalized artist, album,
-title, and genre fields, a filesystem path, raw tag metadata, and timestamps.
-The wrapper reads this collection to decide whether downloads succeeded and to
-resolve M3U paths.
+Newly imported records include normalized display metadata plus Spotify
+ID/URL, ISRC, duration, source provider/ID, match score, checksum, format,
+canonical path, provenance metadata, and timestamps.
+
+For an upsert, the database filter uses the first non-empty input identity:
+Spotify ID, otherwise ISRC, otherwise path. It does not query each identity in
+sequence. The operation returns the stored document, including its catalog ID.
+Startup attempts to create a sparse unique index on Spotify ID and sparse
+non-unique index on checksum. Duplicate checksums are valid because identical
+content can be referenced by more than one catalog record; ISRC and path are
+not currently unique or separately indexed here.
+
+### `playlist-requests`
+
+This remains a legacy boolean/counter queue: URL, creator, `active`, `errored`,
+`retry_count`, and `no_pull`. It does not yet use the download queue's atomic
+claim, lease, typed errors, or explicit states.
 
 ### `index-status`
 
-[`IndexStatus`](../models/indexation.go) contains `last_updated` and
-`last_indexed`. The code treats the collection as containing one document but
-does not enforce or initialize that invariant.
+The model and database methods remain, as does the unused
+`IndexDownloadedFiles` implementation, but the active download and one-off
+playlist flows no longer read or write `index-status`. Synchronous importer
+catalog upsert replaced the indexer gate for worker-acquired files.
 
-No schema migration or index creation establishes unique active requests,
-queue ordering, atomic ownership, or a singleton index-status document.
+Index creation is best effort. Duplicate legacy Spotify IDs can prevent the
+unique index from being created without preventing startup; operators must
+inspect the warning and clean the data before retrying index creation.
 
-## Configuration and runtime
+## One-off playlist behavior
 
-The worker configuration is defined in
-[`config.go`](../spotdl-wapper/pkg/config/config.go).
+One-off processing is implemented in
+[`playlist_requests.go`](../spotdl-wapper/pkg/service/playlist_requests.go):
 
-| Variable | Use |
-| --- | --- |
-| `DATABASE_URL`, `DATABASE_NAME` | MongoDB queue, catalog, and index status |
-| `DESTINATION` | `spotdl` output template and, incorrectly, M3U base path |
-| `MUSIC_LIBRARY_PATH` | Required and passed to the M3U helper, but currently ignored |
-| `SLEEP_IN_MINUTES` | Delay before each queued request |
-| `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | Go Spotify metadata client |
-| `LOKI_ENABLED`, `LOKI_URL` | Optional remote log sink |
+1. Read active `playlist-requests`.
+2. Defer a playlist while a download request for the same Spotify playlist URL
+   remains active.
+3. Fetch the current playlist name and items from Spotify.
+4. Resolve catalog paths by case-insensitive exact artist/title matching,
+   including a first-artist fallback.
+5. If the catalog is empty, treat every usable playlist track as missing.
+6. Unless `no_pull` is set, enqueue individual pending track requests not
+   already represented by in-flight, review, or successful history.
+7. If any track remains missing and `no_pull` is false, leave the playlist
+   active and do not write a partial M3U, whether or not this pass created new
+   work.
+8. When nothing is missing, or when `no_pull` explicitly allows omission,
+   write an M3U from the catalog paths currently available.
 
-Compose additionally mounts `SPOTDL_CONFIG_PATH` at
-`/home/appuser/.spotdl:ro`.
+Playlist filenames are sanitized and length-limited. The M3U helper creates the
+parent directory, rejects line injection, requires each entry to be an existing
+regular non-symlink file, and enforces containment against the resolved library
+root even through parent-directory symlinks. It flushes a temporary file,
+atomically replaces the playlist, and syncs the playlist output directory.
 
-The runtime image installs Python, `spotdl`, `yt-dlp`, `yt-dlp-ejs`, FFmpeg,
-Node.js, and npm. The Python packages are installed without version pins or a
-lock file, so rebuilding the same Git revision can produce a different
-downloader stack.
+An empty `no_pull` playlist produces a valid empty M3U. Waiting for missing
+files is expected coordination: it does not set `errored`, increment
+`retry_count`, or deactivate the playlist. Other errors increment the legacy
+retry counter and deactivate the request after five failed passes.
 
-The container runs as a non-root user and needs write access to the mounted
-music directory.
+Waiting can be indefinite. Duplicate suppression treats some existing
+download-request histories, including review or successful records, as already
+represented. If such a request has no usable catalog file, the playlist
+neither creates a replacement request nor completes. One-off playlist requests
+also have no claim or lease.
 
-## Current upstream compatibility
+## Spotify integration
 
-This section is time-sensitive and was checked on 2026-07-27.
+The shared Spotify adapter supports an optional `SPOTIFY_REFRESH_TOKEN`:
 
-The shared Spotify client pins `github.com/zmb3/spotify/v2 v2.4.3`.
-`GetPlaylistItems` in that version calls the legacy
-`GET /playlists/{id}/tracks` route. Spotify's February 2026 Development Mode
-changes replaced it with `GET /playlists/{id}/items`, changed response fields,
-and limited playlist contents to playlists the authenticated user owns or
-collaborates on. The wrapper uses client-credentials authentication, which has
-no user identity, so it cannot satisfy that ownership model. Extended Quota
-Mode apps are not affected by those endpoint changes.
+- with a refresh token, it creates a user OAuth token source;
+- without one, it retains client-credentials authentication for non-user
+  metadata and Extended Quota deployments.
 
-See Spotify's
+Playlist contents use the current paginated
+`GET /v1/playlists/{id}/items` response and its `item` field. A first-page 404
+under client credentials falls back to the legacy client route for
+compatibility. Local, null, empty-ID, non-track, and explicitly unplayable
+items are excluded. Errors from the Spotify SDK are normalized into the
+worker's status-carrying API error. The direct playlist-items request also
+preserves `Retry-After` and Spotify's reason field; those fields are not
+available from the SDK's error type.
+
+Spotify Development Mode playlist reads require user authorization and are
+limited by Spotify's current ownership/collaboration rules. The repository
+accepts a refresh token but does not implement the interactive authorization
+flow that obtains one. There is no application-level metadata cache; quota
+control currently relies on request scheduling and retry classification. See
+Spotify's
 [February 2026 migration guide](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide)
-and
-[changelog](https://developer.spotify.com/documentation/web-api/references/changes/february-2026).
+and [API changelog](https://developer.spotify.com/documentation/web-api/references/changes/february-2026).
 
-Development Mode quotas are also shared per developer account as of July 2026,
-and quota exhaustion is reported as a 429 body with
-`reason: "QUOTA_EXCEEDED"`. The current client has no application-level cache,
-quota classification, or explicit retry/backoff policy. See Spotify's
-[quota update](https://developer.spotify.com/blog/2026-07-23-web-api-quota-updates).
+## Configuration and container
 
-The image installs whichever `spotdl` release is current at image-build time.
-Recent spotDL releases have changed Spotify implementations, JavaScript runtime
-requirements, and the Python library API. This reinforces that an unpinned
-rebuild is not a reproducible deployment; see the
-[spotDL release history](https://github.com/spotDL/spotify-downloader/releases).
+The complete setting reference is in
+[`configuration.md`](./configuration.md). Important operational distinctions
+are:
 
-## Observability and security characteristics
+- `MEDIA_OUTPUT_TEMPLATE` controls final media paths;
+- `PLAYLISTS_OUTPUT_PATH` controls M3U placement;
+- `ACQUISITION_STAGING_PATH` contains provider output;
+- `DESTINATION` is only a deprecated media-template alias;
+- `WORKER_POLL_INTERVAL` controls ticker cadence;
+- `SLEEP_IN_MINUTES` only throttles requests within a drain.
 
-- Console output is always enabled at debug level.
-- Loki output is optional and starts at info level.
-- `spotdl` output is logged as unparsed lines; there are no structured
-  per-track result codes or final output paths.
-- There are no queue-depth, duration, success-rate, retry, or stuck-job
-  metrics.
-- There is no worker health/readiness endpoint.
-- Startup logs the complete configuration object. That includes the Spotify
-  client secret and can include credentials in the MongoDB and Loki URLs. When
-  Loki is enabled, this log is also eligible for remote shipping.
+The container runs as non-root UID 10001. The mounted music library must allow
+that user to create staging, media, and playlist files. Compose defaults the
+spotDL configuration host path to `./.spotdl`, mounts it at both spotDL's
+current and temporary legacy locations, and leaves Loki delivery disabled by
+default.
 
-## Known failure modes and migration hazards
+The Dockerfile currently pins:
 
-These are observable properties of the current implementation, not hypothetical
-concerns:
+| Component | Version |
+| --- | --- |
+| Go builder | 1.23.4 |
+| Python runtime | 3.13.14 |
+| Deno | 2.9.4 |
+| spotDL | 4.5.2 |
+| yt-dlp | 2026.7.4 |
+| yt-dlp-ejs | 0.8.0 |
 
-1. **A clean Compose deployment lacks a working index path.** The tracked stack
-   neither creates `index-status` nor runs the ignored indexer. Downloads can
-   exist on disk without becoming visible in `music-files`, and playlist
-   processing can remain gated indefinitely.
-2. **Indexer lag is counted as downloader failure.** The worker checks
-   `music-files` immediately after `spotdl`. An asynchronously created file can
-   still increment `failed_attempts`; a command failure can be counted once by
-   the download branch and again by final reconciliation.
-3. **There is no exclusive queue ownership.** Multiple workers can process the
-   same active document. Re-fetching by Spotify URL rather than `_id` is also
-   ambiguous when duplicate URLs exist.
-4. **Inactive does not mean successful.** Duplicate suppression treats any
-   inactive historical request as already synced, including errored or
-   skipped requests. This can suppress future automatic recovery.
-5. **A completely absent playlist cannot bootstrap itself.** Legacy playlist
-   processing returns when `FindMusicFiles` finds zero entries, before it
-   reaches the missing-track enqueue loop. The newer subscribed-playlist path
-   in `dynamic-playlists` does continue in this case.
-6. **Legacy metadata enrichment can be overwritten.** `ProcessRequest` updates
-   a value-copy with fetched type/count/metadata; its caller later writes stale
-   outer fields back after re-fetching only part of the request.
-7. **M3U writes are neither idempotent nor atomic.** The output directory is not
-   created, an existing file is treated as an error, and a process failure
-   during creation can leave partial state.
-8. **Cancellation is not propagated.** Context cancellation does not terminate
-   `spotdl`, and there is no command timeout.
-9. **Errors are lossy.** MongoDB stores booleans and counters but not a typed
-   error, provider/source ID, candidate confidence, final path, or subprocess
-   diagnostic.
-10. **Secrets are emitted to logs.** This should be fixed before enabling or
-    expanding remote logging.
+The image runs `pip check` and downloader version checks during the build.
+These are version pins, not fully reproducible image digests or a complete
+transitive lock: Debian packages, base-image contents, and Python transitive
+resolution can still change.
 
-## Dead, stale, or unwired paths
+Startup logging uses a non-secret allowlist and does not serialize credentials,
+MongoDB/Loki URLs, or refresh tokens. Console logs are debug-level; optional
+Loki delivery starts at info-level.
 
-- `IndexDownloadedFiles` has no callers and attempts to execute the literal,
-  machine-specific command name `sh /home/maks/run_music_indexer.sh`.
-- `db.IndexMusicFile` is exposed but unused.
-- `FindUnindexedSongs` and `PlaylistTrack` are only exercised by tests.
-- `spotdl-wapper/.github/workflows/ci.yml` is nested below the repository's
-  workflow directory, so GitHub does not run it as a monorepo workflow. It also
-  describes an older standalone-repository layout.
+## Remaining limitations and migration hazards
 
-## Tests and CI
+1. **Direct yt-dlp is an operator/legal choice.** It is not an official Spotify
+   download path and must be restricted to authorized content.
+2. **spotDL remains a black-box matcher.** The compatibility provider reports a
+   synthetic unscored value of `0`; the wrapper cannot review spotDL's selected
+   source before acquisition.
+3. **Direct matching is conservative but incomplete.** Explicit/clean edition,
+   recording identity, regional alternatives, and source quality are not
+   scored. Candidate reasons are not persisted, and there is no review UI.
+4. **Backend affinity lacks controlled routing.** First claim is durably pinned
+   and retries cannot drift, but an unassigned request goes to whichever
+   provider worker claims it first. Producers cannot select a cohort, and there
+   is no audited re-route operation. Removing a provider's workers leaves its
+   pinned unfinished jobs unclaimable by the other backend.
+5. **Identity behavior is not uniform.** Download prechecks prefer Spotify ID
+   and ISRC and validate the file, but the catalog upsert filter selects only
+   the first non-empty input identity. Playlist materialization still matches
+   artist/title and can conflate editions or miss differently normalized
+   historical records.
+6. **Filesystem and MongoDB are not transactional.** A crash between publish
+   and the recovery-journal write can still leave an uncataloged final file or
+   require reacquisition. Journaled catalog failures resume without
+   reacquisition, but staging-attempt cleanup does not reconcile the remaining
+   final-library crash boundary.
+7. **Validation has no quality policy.** FFprobe requires an audio stream and
+   duration agreement, but there is no codec allowlist, bitrate floor,
+   loudness policy, artwork requirement, or explicit tag-schema version.
+8. **One-off playlist jobs retain legacy coordination.** They have no claim or
+   lease. Missing files no longer consume their error budget or produce a
+   partial non-`no_pull` M3U, but dependency history without a usable catalog
+   file can leave them active forever. A continuously replenished download
+   queue can also starve playlist processing.
+9. **Playlist ownership is duplicated.** `spotdl-wapper` owns one-off requests
+   while `dynamic-playlists` separately owns subscribed/dynamic materialization.
+10. **External files still need reconciliation.** Synchronous catalog upsert
+    covers worker imports only; there is no tracked scanner in the supported
+    stack for files added outside this pipeline.
+11. **Best-effort indexes require operational follow-up.** Legacy duplicates
+    can leave the unique Spotify-ID index unenforced apart from a startup
+    warning. Checksum is deliberately non-unique; ISRC and path also have no
+    uniqueness constraint.
+12. **Operational visibility is log-only.** There are no queue-depth,
+    lease-age, latency, wrong-match/review-rate, or import metrics and no worker
+    health endpoint.
+13. **Some legacy code remains.** Index-status methods, the unused indexer
+    launcher, old database methods, and test-only M3U scanning structures
+    should be removed only after compatibility consumers are audited.
 
-The only wrapper tests are for the M3U utility functions in
-[`m3u_test.go`](../spotdl-wapper/pkg/utils/m3u_test.go). The queue processor,
-MongoDB adapter, Spotify integration, subprocess behavior, retry semantics, and
-playlist processor have no tests.
+## Tests and verification surface
 
-On this snapshot, `go test -cover ./...` reports 91.9% coverage for
-`pkg/utils`; the root package, configuration, database, Loki, and service
-packages each report 0.0%.
+The wrapper now has unit/contract coverage for:
 
-Current CI:
+- provider selection, spotDL/yt-dlp commands, machine-output parsing,
+  cancellation on Linux and Darwin, diagnostics, and candidate scoring;
+- importer path safety, provider-checksum verification, duration validation,
+  canonical metadata, deterministic muxing, bounded components, final
+  checksums, collision/idempotency behavior, publication, discard, and
+  ownership-marked orphan-attempt cleanup;
+- atomic claims, random claim fencing, backend affinity, lease ownership,
+  legacy eligibility, state dual-writing, duplicate suppression, and catalog
+  identity;
+- request completion, no-candidate review, retry exhaustion, Spotify
+  `Retry-After`, stable-identity catalog prechecks, invalid-catalog-file
+  rejection, imported recovery journaling, and catalog-resume behavior;
+- empty-catalog/no-pull and missing-file wait behavior, safe filenames,
+  symlink-safe contained M3U entries, and durable atomic replacement;
+- configuration defaults and validation;
+- the current Spotify `/items` response, local/unplayable item filtering, SDK
+  error normalization, and error classification.
 
-- runs `go test ./...`;
-- runs Go linting;
-- builds the Go worker for Linux and macOS;
-- builds a release container on tags.
+The remaining test gap is a container-level, real-MongoDB and real-tool
+end-to-end test covering request creation through final M3U output. Production
+rollout should also use a curated audio matching corpus; unit tests cannot
+measure real wrong-match rates.
 
-It does not run a MongoDB integration test, build and invoke the complete
-downloader image as a smoke test, or verify a download-to-index-to-M3U flow.
-
-## Current coupling and replacement seams
-
-There is no downloader interface inside the service. Queue orchestration,
-Spotify resolution, command construction, library reconciliation, and playlist
-generation are methods on the same concrete service.
-
-The practical seams for a staged replacement are:
-
-1. **Queue repository** — atomically claim and transition durable jobs.
-2. **Metadata resolver** — turn an input URL into stable track specifications.
-3. **Acquisition backend** — return a structured artifact or typed failure.
-4. **Library importer/indexer** — validate tags, move the artifact, and return
-   the canonical path in the same operation.
-5. **Playlist materializer** — consume catalog paths and own M3U updates.
-
-Keeping the existing MongoDB document shape readable during a migration allows
-`album-queue` and `dynamic-playlists` to move independently from the downloader
-backend.
-
-The proposed target and staged cutover are documented in
+The migration history and operational rollout/rollback plan are documented in
 [`spotdl-wapper-migration.md`](./spotdl-wapper-migration.md).

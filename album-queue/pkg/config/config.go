@@ -13,6 +13,7 @@ type Config struct {
 
 	SpotifyClientID     string `envconfig:"SPOTIFY_CLIENT_ID" required:"true"`
 	SpotifyClientSecret string `envconfig:"SPOTIFY_CLIENT_SECRET" required:"true"`
+	SpotifyRefreshToken string `envconfig:"SPOTIFY_REFRESH_TOKEN"`
 }
 
 func NewConfig() (*Config, error) {

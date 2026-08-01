@@ -49,7 +49,13 @@ func main() {
 
 	log.Info("Database connection established")
 
-	spotifyService := spotify.NewSpotifyService(ctx, cfg.SpotifyClientID, cfg.SpotifyClientSecret, log)
+	spotifyService := spotify.NewSpotifyServiceWithRefreshToken(
+		ctx,
+		cfg.SpotifyClientID,
+		cfg.SpotifyClientSecret,
+		cfg.SpotifyRefreshToken,
+		log,
+	)
 	log.Info("Spotify service initialized")
 
 	// Health check server with graceful shutdown

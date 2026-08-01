@@ -318,11 +318,45 @@ func (d *db) FindMusicFiles(ctx context.Context, artists, titles []string) ([]mo
 }
 
 func (d *db) CheckIfRequestAlreadySynced(ctx context.Context, url string) (bool, error) {
-	count, err := d.downloadQueueRequestCollection().CountDocuments(ctx, bson.M{"spotify_url": url, "active": false})
+	count, err := d.downloadQueueRequestCollection().CountDocuments(ctx, alreadySyncedFilter(url))
 	if err != nil && err != mongo.ErrNoDocuments {
 		return false, err
 	}
 	return count > 0, nil
+}
+
+func alreadySyncedFilter(url string) bson.M {
+	inFlightOrSuccessfulStates := bson.A{
+		models.DownloadRequestStatePending,
+		models.DownloadRequestStateClaimed,
+		models.DownloadRequestStateResolving,
+		models.DownloadRequestStateDownloading,
+		models.DownloadRequestStateValidating,
+		models.DownloadRequestStateImported,
+		models.DownloadRequestStateRetryWait,
+		models.DownloadRequestStateNeedsReview,
+		models.DownloadRequestStateCompleted,
+	}
+	return bson.M{
+		"spotify_url": url,
+		"$or": bson.A{
+			bson.M{"state": bson.M{"$in": inFlightOrSuccessfulStates}},
+			bson.M{"$and": bson.A{
+				bson.M{"$or": bson.A{
+					bson.M{"state": bson.M{"$exists": false}},
+					bson.M{"state": nil},
+					bson.M{"state": ""},
+				}},
+				bson.M{"$or": bson.A{
+					bson.M{"active": true},
+					bson.M{"$and": bson.A{
+						bson.M{"active": false},
+						bson.M{"errored": bson.M{"$ne": true}},
+					}},
+				}},
+			}},
+		},
+	}
 }
 
 func (d *db) NewDownloadRequest(ctx context.Context, url, name string, creatorID int64, objectType spotify.SpotifyObjectType) error {
@@ -331,16 +365,8 @@ func (d *db) NewDownloadRequest(ctx context.Context, url, name string, creatorID
 		return err
 	}
 
-	request := models.DownloadQueueRequest{
-		SpotifyURL: url,
-		ObjectType: objectType,
-		Name:       name,
-		Active:     true,
-		ID:         id.String(),
-		CreatedAt:  time.Now().Unix(),
-		UpdatedAt:  time.Now().Unix(),
-		CreatorID:  creatorID,
-	}
+	now := time.Now().Unix()
+	request := newDownloadQueueRequest(id.String(), url, name, creatorID, objectType, now)
 
 	_, err = d.downloadQueueRequestCollection().InsertOne(ctx, request)
 	if err != nil {
@@ -348,4 +374,23 @@ func (d *db) NewDownloadRequest(ctx context.Context, url, name string, creatorID
 	}
 
 	return nil
+}
+
+func newDownloadQueueRequest(
+	id, url, name string,
+	creatorID int64,
+	objectType spotify.SpotifyObjectType,
+	now int64,
+) models.DownloadQueueRequest {
+	return models.DownloadQueueRequest{
+		SpotifyURL: url,
+		ObjectType: objectType,
+		Name:       name,
+		Active:     true,
+		State:      models.DownloadRequestStatePending,
+		ID:         id,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		CreatorID:  creatorID,
+	}
 }

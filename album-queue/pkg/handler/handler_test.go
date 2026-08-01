@@ -25,9 +25,14 @@ type newRequestCall struct {
 type fakeDatabase struct {
 	unresolvedTracks []db.FailedTrack
 	activeByURL      map[string]bool
+	activeRequests   []models.DownloadQueueRequest
+	musicFiles       []models.MusicFile
 
-	newRequestErr error
-	newRequests   []newRequestCall
+	newRequestErr   error
+	newRequests     []newRequestCall
+	updatedRequests []models.DownloadQueueRequest
+	deactivatedIDs  []string
+	deactivateErr   error
 }
 
 func (f *fakeDatabase) NewDownloadRequest(_ context.Context, url, name string, creatorID int64, objectType spotify.SpotifyObjectType, expectedTrackCount int, trackMetadata []spotify.TrackMetadata) error {
@@ -43,7 +48,7 @@ func (f *fakeDatabase) NewDownloadRequest(_ context.Context, url, name string, c
 }
 
 func (f *fakeDatabase) GetActiveRequests(context.Context) ([]models.DownloadQueueRequest, error) {
-	return nil, nil
+	return append([]models.DownloadQueueRequest(nil), f.activeRequests...), nil
 }
 
 func (f *fakeDatabase) GetUnresolvedFailedTracks(context.Context) ([]db.FailedTrack, error) {
@@ -64,8 +69,9 @@ func (f *fakeDatabase) HasActiveRequestByURL(_ context.Context, trackURL string)
 	return f.activeByURL[trackURL], nil
 }
 
-func (f *fakeDatabase) DeactivateRequest(context.Context, string) error {
-	return nil
+func (f *fakeDatabase) DeactivateRequest(_ context.Context, id string) error {
+	f.deactivatedIDs = append(f.deactivatedIDs, id)
+	return f.deactivateErr
 }
 
 func (f *fakeDatabase) NewPlaylistRequest(context.Context, string, int64, bool) error {
@@ -77,10 +83,11 @@ func (f *fakeDatabase) GetActivePlaylists(context.Context) ([]models.PlaylistReq
 }
 
 func (f *fakeDatabase) FindMusicFiles(context.Context, []string, []string) ([]models.MusicFile, error) {
-	return nil, nil
+	return append([]models.MusicFile(nil), f.musicFiles...), nil
 }
 
-func (f *fakeDatabase) UpdateDownloadRequest(context.Context, models.DownloadQueueRequest) error {
+func (f *fakeDatabase) UpdateDownloadRequest(_ context.Context, request models.DownloadQueueRequest) error {
+	f.updatedRequests = append(f.updatedRequests, request)
 	return nil
 }
 
@@ -160,6 +167,63 @@ func createTestHandler(database *fakeDatabase, sinks *testSinks) *handler {
 
 func testMessage(text string) *telebot.Message {
 	return &telebot.Message{Text: text, Sender: &telebot.User{ID: 1}}
+}
+
+func TestHandleQueue_RendersProgressWithoutMutatingWorkerJob(t *testing.T) {
+	request := models.DownloadQueueRequest{
+		ID:                 "request-1",
+		Name:               "Album",
+		Active:             true,
+		State:              models.DownloadRequestStateDownloading,
+		WorkerID:           "worker-1",
+		LeaseExpiresAt:     999,
+		ExpectedTrackCount: 1,
+		TrackMetadata: []spotify.TrackMetadata{{
+			Artist: "Artist",
+			Title:  "Title",
+		}},
+	}
+	database := &fakeDatabase{
+		activeByURL:    map[string]bool{},
+		activeRequests: []models.DownloadQueueRequest{request},
+		musicFiles: []models.MusicFile{{
+			Artist: "Artist",
+			Title:  "Title",
+		}},
+	}
+	sinks := &testSinks{}
+	h := createTestHandler(database, sinks)
+
+	h.HandleQueue(testMessage("/queue"))
+
+	if len(database.updatedRequests) != 0 {
+		t.Fatalf("queue rendering persisted %d stale request updates", len(database.updatedRequests))
+	}
+	stored := database.activeRequests[0]
+	if !stored.Active ||
+		stored.State != models.DownloadRequestStateDownloading ||
+		stored.WorkerID != "worker-1" ||
+		stored.LeaseExpiresAt != 999 {
+		t.Fatalf("worker-owned fields changed during queue rendering: %+v", stored)
+	}
+	if len(sinks.replies) != 1 || !strings.Contains(sinks.replies[0], "1/1 (100%)") {
+		t.Fatalf("queue did not render refreshed local progress: %#v", sinks.replies)
+	}
+}
+
+func TestHandleDeactivate_DelegatesExplicitCancellation(t *testing.T) {
+	database := &fakeDatabase{activeByURL: map[string]bool{}}
+	sinks := &testSinks{}
+	h := createTestHandler(database, sinks)
+
+	h.HandleDeactivate(testMessage("/deactivate request-1"))
+
+	if len(database.deactivatedIDs) != 1 || database.deactivatedIDs[0] != "request-1" {
+		t.Fatalf("deactivated IDs = %#v, want request-1", database.deactivatedIDs)
+	}
+	if len(sinks.replies) != 1 || !strings.Contains(sinks.replies[0], "деактивовано") {
+		t.Fatalf("unexpected deactivate reply: %#v", sinks.replies)
+	}
 }
 
 func TestHandleFailedReturnsEmptyState(t *testing.T) {

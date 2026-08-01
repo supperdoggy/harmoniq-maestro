@@ -10,6 +10,7 @@ type Config struct {
 	PlaylistsOutputPath string `envconfig:"PLAYLISTS_OUTPUT_PATH" required:"true"`
 	SpotifyClientID     string `envconfig:"SPOTIFY_CLIENT_ID" required:"true"`
 	SpotifyClientSecret string `envconfig:"SPOTIFY_CLIENT_SECRET" required:"true"`
+	SpotifyRefreshToken string `envconfig:"SPOTIFY_REFRESH_TOKEN"`
 	DryRun              bool   `envconfig:"DRY_RUN" default:"false"`
 }
 

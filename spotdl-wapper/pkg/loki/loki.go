@@ -76,7 +76,7 @@ func NewLokiCore(lokiURL string, labels map[string]string, level zapcore.Level) 
 		stopCh:        make(chan struct{}),
 	}
 
-	fmt.Printf("[loki] initialized, pushing to: %s\n", core.url)
+	fmt.Println("[loki] initialized")
 	go core.flushLoop()
 	return core
 }
@@ -199,8 +199,8 @@ func (c *LokiCore) flush() {
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("[loki] push failed with status %d: %s\n", resp.StatusCode, string(body))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		fmt.Printf("[loki] push failed with status %d\n", resp.StatusCode)
 	} else {
 		fmt.Printf("[loki] pushed %d log entries\n", len(toSend))
 	}

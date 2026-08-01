@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/spotdl-wapper/pkg/utils"
@@ -19,18 +20,6 @@ var (
 )
 
 func (s *service) ProcessPlaylistRequest(ctx context.Context) error {
-
-	indexStatus, err := s.database.GetIndexStatus(ctx)
-	if err != nil {
-		s.log.Error("failed to get index status", zap.Error(err))
-		return err
-	}
-
-	if indexStatus.LastUpdated > indexStatus.LastIndexed {
-		s.log.Info("indexing in progress, skipping playlist processing")
-		return nil
-	}
-
 	playlists, err := s.database.GetActivePlaylists(ctx)
 	if err != nil {
 		s.log.Error("failed to get active playlists", zap.Error(err))
@@ -39,26 +28,44 @@ func (s *service) ProcessPlaylistRequest(ctx context.Context) error {
 
 	s.log.Info("processing active playlists", zap.Any("playlists", len(playlists)))
 
+	var processingErrors []error
 	for _, playlist := range playlists {
-		if err := s.ProcessPlaylist(ctx, playlist); err != nil {
-			s.log.Error("failed to process playlist", zap.Error(err), zap.Any("playlist", playlist))
+		processErr := s.ProcessPlaylist(ctx, playlist)
+		switch {
+		case processErr == nil:
+			playlist.Active = false
+			playlist.Errored = false
+		case errors.Is(processErr, ErrMissingFiles):
+			// Waiting for already-queued downloads is expected coordination,
+			// not a failed playlist attempt.
+			playlist.Active = true
+			playlist.Errored = false
+			s.log.Info("playlist is waiting for missing tracks", zap.String("playlist_id", playlist.ID))
+		default:
+			s.log.Error("failed to process playlist", zap.Error(processErr), zap.Any("playlist", playlist))
 			playlist.Errored = true
 			playlist.RetryCount++
-		} else {
-			playlist.Active = false
+			processingErrors = append(
+				processingErrors,
+				fmt.Errorf("process playlist %s: %w", playlist.ID, processErr),
+			)
 		}
 
-		if playlist.RetryCount >= 5 {
+		if processErr != nil && !errors.Is(processErr, ErrMissingFiles) && playlist.RetryCount >= 5 {
 			playlist.Active = false
 		}
 
 		if err := s.database.UpdatePlaylistRequest(ctx, playlist); err != nil {
 			s.log.Error("failed to update playlist", zap.Error(err), zap.Any("playlist", playlist))
+			processingErrors = append(
+				processingErrors,
+				fmt.Errorf("update playlist %s: %w", playlist.ID, err),
+			)
 		}
 	}
 
 	s.log.Info("completed processing of active playlists")
-	return nil
+	return errors.Join(processingErrors...)
 }
 
 func (s *service) ProcessPlaylist(ctx context.Context, playlist models.PlaylistRequest) error {
@@ -112,8 +119,10 @@ func (s *service) ProcessPlaylist(ctx context.Context, playlist models.PlaylistR
 	}
 
 	if len(foundMusic) == 0 {
-		s.log.Error("no indexed paths found for playlist", zap.Any("playlistName", playlistName))
-		return errors.New("no indexed paths found for playlist")
+		s.log.Warn(
+			"no catalog paths found for playlist; treating all tracks as missing",
+			zap.String("playlist_name", playlistName),
+		)
 	}
 
 	foundMusicMap := make(map[string]models.MusicFile)
@@ -220,20 +229,14 @@ func (s *service) ProcessPlaylist(ctx context.Context, playlist models.PlaylistR
 
 		if createdCount > 0 {
 			s.log.Info("created download requests for missing tracks", zap.Int("count", createdCount), zap.Int("total_missing", len(missingMusicFiles)))
-			return ErrMissingFiles
 		} else {
-			s.log.Info("all missing tracks already synced or failed to create requests", zap.Int("total_missing", len(missingMusicFiles)))
+			s.log.Info("missing tracks are already queued or could not be queued", zap.Int("total_missing", len(missingMusicFiles)))
 		}
+		return ErrMissingFiles
 	}
 
-	for i, path := range indexedPaths {
-		indexedPaths[i] = strings.ReplaceAll(path, "/mnt/music", "/music")
-	}
-
-	playlistPathName := strings.ReplaceAll(playlistName, "/", `-`)
-	// playlistPathName = strings.ReplaceAll(playlistPathName, " ", `\ `)
-
-	outputPath := s.destination + "/Playlists/" + playlistPathName + ".m3u"
+	playlistPathName := utils.SanitizePlaylistName(playlistName)
+	outputPath := filepath.Join(s.playlistsOutputPath, playlistPathName+".m3u")
 
 	if err := utils.CreateM3UPlaylist(indexedPaths, s.libraryPath, outputPath); err != nil {
 		s.log.Error("failed to create m3u playlist", zap.Error(err))

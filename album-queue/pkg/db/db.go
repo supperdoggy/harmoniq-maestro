@@ -98,19 +98,17 @@ func (d *db) Ping(ctx context.Context) error {
 
 func (d *db) NewDownloadRequest(ctx context.Context, url, name string, creatorID int64, objectType spotify.SpotifyObjectType, expectedTrackCount int, trackMetadata []spotify.TrackMetadata) error {
 	id := uuid.NewV4()
-	request := models.DownloadQueueRequest{
-		SpotifyURL:         url,
-		ObjectType:         objectType,
-		Name:               name,
-		Active:             true,
-		ID:                 id.String(),
-		CreatedAt:          time.Now().Unix(),
-		UpdatedAt:          time.Now().Unix(),
-		CreatorID:          creatorID,
-		ExpectedTrackCount: expectedTrackCount,
-		FoundTrackCount:    0,
-		TrackMetadata:      trackMetadata,
-	}
+	now := time.Now().Unix()
+	request := newDownloadQueueRequest(
+		id.String(),
+		url,
+		name,
+		creatorID,
+		objectType,
+		expectedTrackCount,
+		trackMetadata,
+		now,
+	)
 
 	_, err := d.downloadQueueRequestCollection.InsertOne(ctx, request)
 	if err != nil {
@@ -118,6 +116,30 @@ func (d *db) NewDownloadRequest(ctx context.Context, url, name string, creatorID
 	}
 
 	return nil
+}
+
+func newDownloadQueueRequest(
+	id, url, name string,
+	creatorID int64,
+	objectType spotify.SpotifyObjectType,
+	expectedTrackCount int,
+	trackMetadata []spotify.TrackMetadata,
+	now int64,
+) models.DownloadQueueRequest {
+	return models.DownloadQueueRequest{
+		SpotifyURL:         url,
+		ObjectType:         objectType,
+		Name:               name,
+		Active:             true,
+		State:              models.DownloadRequestStatePending,
+		ID:                 id,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		CreatorID:          creatorID,
+		ExpectedTrackCount: expectedTrackCount,
+		FoundTrackCount:    0,
+		TrackMetadata:      trackMetadata,
+	}
 }
 
 func (d *db) NewPlaylistRequest(ctx context.Context, url string, creatorID int64, noPull bool) error {
@@ -221,10 +243,11 @@ func (d *db) GetActivePlaylists(ctx context.Context) ([]models.PlaylistRequest, 
 }
 
 func (d *db) DeactivateRequest(ctx context.Context, id string) error {
+	now := time.Now().Unix()
 	result, err := d.downloadQueueRequestCollection.UpdateOne(
 		ctx,
 		bson.M{"_id": id},
-		bson.M{"$set": bson.M{"active": false, "updated_at": time.Now().Unix()}},
+		deactivateRequestUpdate(now),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to deactivate request: %w", err)
@@ -235,6 +258,23 @@ func (d *db) DeactivateRequest(ctx context.Context, id string) error {
 	}
 
 	return nil
+}
+
+func deactivateRequestUpdate(now int64) bson.M {
+	return bson.M{
+		"$set": bson.M{
+			"active":     false,
+			"errored":    false,
+			"state":      models.DownloadRequestStateCancelled,
+			"updated_at": now,
+		},
+		"$unset": bson.M{
+			"worker_id":        "",
+			"claim_id":         "",
+			"lease_expires_at": "",
+			"next_attempt_at":  "",
+		},
+	}
 }
 
 func (d *db) FindMusicFiles(ctx context.Context, artists, titles []string) ([]models.MusicFile, error) {
@@ -277,15 +317,7 @@ func (d *db) UpdateDownloadRequest(ctx context.Context, request models.DownloadQ
 	result, err := d.downloadQueueRequestCollection.UpdateOne(
 		ctx,
 		bson.M{"_id": request.ID},
-		bson.M{"$set": bson.M{
-			"expected_track_count": request.ExpectedTrackCount,
-			"found_track_count":    request.FoundTrackCount,
-			"track_metadata":       request.TrackMetadata,
-			"name":                 request.Name,
-			"active":               request.Active,
-			"object_type":          request.ObjectType,
-			"updated_at":           request.UpdatedAt,
-		}},
+		downloadProgressUpdate(request.FoundTrackCount),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to update download request: %w", err)
@@ -296,6 +328,17 @@ func (d *db) UpdateDownloadRequest(ctx context.Context, request models.DownloadQ
 	}
 
 	return nil
+}
+
+// downloadProgressUpdate is intentionally ownership-safe. Queue display code
+// may record an observed catalog count, but it must not replace lifecycle,
+// lease, error, or track metadata owned by the acquisition worker.
+func downloadProgressUpdate(foundTrackCount int) bson.M {
+	return bson.M{
+		"$max": bson.M{
+			"found_track_count": foundTrackCount,
+		},
+	}
 }
 
 func (d *db) GetStats(ctx context.Context) (*Stats, error) {

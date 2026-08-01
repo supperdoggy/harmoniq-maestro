@@ -1,367 +1,526 @@
-# Migrating away from `spotdl-wapper`
+# Migrating away from spotDL
 
-This document proposes a staged replacement for the current wrapper. Read
-[`spotdl-wapper-current-state.md`](./spotdl-wapper-current-state.md) first for
-the existing lifecycle and contracts.
+This document records the replacement decision, what has already been
+implemented, and how to roll out or roll back another acquisition backend
+without coupling queue correctness to that backend.
 
-## Decision summary
+Read [`spotdl-wapper-current-state.md`](./spotdl-wapper-current-state.md) for
+the exact as-built lifecycle and current limitations.
 
-Do not replace `spotdl-wapper` with another all-in-one downloader service in a
-single cutover. First separate queue orchestration, metadata resolution, media
-acquisition, library import, and playlist materialization behind explicit
-contracts.
+For the observed `music-services` VM, including its remote MongoDB, CIFS path
+contract, legacy cron jobs, worker-only Compose manifest, cutover checks, and
+rollback procedure, use
+[`vm-infrastructure-spotdl-migration.md`](./vm-infrastructure-spotdl-migration.md).
 
-There are then two viable product directions:
+## Decision
 
-1. **Permanent local files remain a requirement.** Keep the Go worker and add a
-   direct `yt-dlp` acquisition backend for content the operator is authorized
-   to download. Use a pinned spotDL backend only as a temporary bridge while the
-   new matching, validation, tagging, and import pipeline is proven.
-2. **Official-service compliance is the priority.** Replace local acquisition
-   with Spotify playback, or turn Spotify links into a wanted list fulfilled by
-   an importer for user-owned or purchased files. Official Spotify playback
-   does not produce local audio files or M3Us.
+Do not replace the entire `spotdl-wapper` service with another all-in-one
+downloader. Keep the Go coordinator and its MongoDB/library contracts, and
+replace only the acquisition provider.
+
+The repository now supports this decision:
+
+- the coordinator works per track through a provider-neutral interface;
+- validation, tagging, publication, and catalog upsert are provider-independent;
+- spotDL is the default compatibility and rollback provider;
+- direct yt-dlp is integrated as an explicit opt-in provider;
+- there is no automatic fallback between providers.
+
+The recommended direction depends on the actual product requirement:
+
+1. **Permanent local files are required and the operator is authorized to
+   obtain them.** Harden and canary the direct yt-dlp provider, keeping spotDL
+   as a temporary rollback path. Add an owned/purchased-file importer as a
+   provenance-safe alternative.
+2. **Official-service compliance and playback are the primary goal.** Build a
+   Spotify playback path. This is a product change: official playback does not
+   produce local files, `music-files` records, or M3Us.
+3. **Local files are required but automatic third-party acquisition is not
+   acceptable.** Use Spotify metadata as a wanted list and fulfill it from a
+   watch folder containing user-owned or purchased assets.
 
 There is no official drop-in service that turns arbitrary Spotify URLs into
-permanent DRM-free local files. Spotify's own endpoint documentation states
-that applications may not facilitate downloads or stream ripping. A direct
-`yt-dlp` backend changes the implementation, not that policy boundary. See
-[Spotify's playlist API policy note](https://developer.spotify.com/documentation/web-api/reference/get-playlist)
+permanent DRM-free local files. A direct yt-dlp backend changes the software
+boundary, not the operator's authorization or the applicable platform terms.
+Use it only for content the deployment is allowed to download. See Spotify's
+[playlist API policy note](https://developer.spotify.com/documentation/web-api/reference/get-playlist)
 and the [YouTube Terms of Service](https://www.youtube.com/t/terms).
 
-## Why a backend swap alone is insufficient
+## Why the coordinator remains
 
-The current component name hides five responsibilities:
+The original wrapper combined five responsibilities:
 
 ```mermaid
 flowchart LR
-    producers["album-queue / dynamic-playlists"]
-    queue[("MongoDB jobs")]
-    coordinator["job coordinator"]
-    metadata["metadata resolver"]
-    acquisition["acquisition backend"]
-    importer["validator / tagger / importer"]
-    catalog[("music-files")]
-    playlists["playlist materializer"]
-
-    producers --> queue
-    queue --> coordinator
-    coordinator --> metadata
-    metadata --> acquisition
-    acquisition --> importer
-    importer --> catalog
-    catalog --> playlists
+    producers["queue producers"] --> queue[("MongoDB jobs")]
+    queue --> coordinator["job coordinator"]
+    coordinator --> metadata["Spotify metadata resolver"]
+    metadata --> provider["replaceable acquisition provider"]
+    provider --> importer["validator / tagger / importer"]
+    importer --> library[("music library")]
+    importer --> catalog[("music-files")]
+    catalog --> playlists["playlist materializer"]
 ```
 
-spotDL currently supplies source search, candidate matching, download,
-transcoding, and tagging. The Go wrapper supplies the other responsibilities,
-but infers success later through artist/title catalog matching. Replacing only
-the executable would preserve the weakest parts of the design:
+Replacing the whole service would force queue ownership, retry semantics,
+library paths, catalog data, and playlist behavior to change at the same time.
+Keeping a provider boundary isolates the volatile part—the source search and
+download tool—from the durable contracts other services consume.
 
-- no atomic job claim or lease;
-- boolean/counter lifecycle instead of durable states;
-- no structured acquisition result;
-- no stable track identity beyond artist/title;
-- an untracked asynchronous indexer in the completion path;
-- two owners for playlist reconciliation and M3U output.
+This also makes a non-downloader provider possible. A watch-folder importer can
+fulfill the same canonical `TrackSpec` and return a staged `AssetResult`
+without changing queue state or the final-library contract.
 
-The migration should therefore replace the acquisition engine and repair its
-surrounding boundary independently.
+## Implementation status
 
-## Options considered
+The original staged proposal is substantially implemented. This table is the
+current migration ledger.
 
-| Option | Local files and M3U | Change size | Long-term fit |
-| --- | --- | --- | --- |
-| Pin and harden the spotDL CLI | Yes | Small | Transition only |
-| Embed spotDL or run a Python sidecar | Yes | Medium | Poor |
-| Direct `yt-dlp` acquisition adapter | Yes | Medium/large | Recommended only for authorized local-file use |
-| Lidarr | Yes | Large product change | Poor for the current per-track Spotify queue |
-| Official Spotify playback | No | Large product change | Recommended when playback is the real goal |
-| Owned/purchased-file importer | Yes | Medium | Recommended compliance-oriented library path |
+| Capability | Status | Notes |
+| --- | --- | --- |
+| Secret-safe startup logging | Implemented | Only an explicit non-secret allowlist is logged |
+| Long-running worker and graceful shutdown | Implemented | Immediate drain plus configurable polling; command cancellation propagates |
+| Current Spotify playlist endpoint | Implemented | Uses `/playlists/{id}/items` and current `item` shape |
+| Spotify user refresh token | Implemented | Operator must obtain the token outside this repository |
+| Spotify `429` classification | Implemented | Status is normalized across API paths; the direct items endpoint can also extend delay from `Retry-After`, while SDK errors do not expose it |
+| Media/playlist path split | Implemented | `MEDIA_OUTPUT_TEMPLATE` and `PLAYLISTS_OUTPUT_PATH`; `DESTINATION` is deprecated |
+| Provider-neutral contract | Implemented | `Resolve` and `Acquire` return candidates/results |
+| Per-track workflow | Implemented | Albums and playlists no longer use bulk spotDL |
+| Pinned spotDL compatibility provider | Implemented | Default backend and rollback path |
+| Direct yt-dlp provider | Implemented | Explicit opt-in with JSON resolution and conservative scoring |
+| Command timeout and process-tree cancellation | Implemented | Direct argv; Linux and Darwin child process-group cancellation |
+| Canonical track/provenance fields | Implemented | Spotify/source IDs, ISRC, duration, path, format, score, checksum |
+| Atomic queue claim and lease | Implemented | Random per-claim fence, heartbeat, and stale-attempt write protection |
+| Explicit durable download states | Implemented | Dual-written with legacy `active`/`errored` flags |
+| Typed failures and scheduled retries | Implemented | Acquisition-pipeline failures share one request-wide budget; published-artifact catalog finalization backs off without consuming it |
+| Synchronous validation and catalog import | Implemented | Provider checksum verification, deterministic FFmpeg tags/artwork, FFprobe duration check, bounded paths, `0640` output, synced hard-link publication, recovery journal/resume, collision handling, and upsert |
+| Private staging attempts and cleanup | Implemented | Providers use marked isolated directories; discard and the old-attempt sweeper enforce resolved no-symlink ownership |
+| Removal of indexer completion gate | Implemented | Active worker paths do not use `index-status` |
+| Atomic/safe one-off M3Us | Implemented | Regular-file and resolved containment checks, replace semantics, and directory sync |
+| Backend affinity per request | Implemented | First claim pins an empty backend; retries and reclaims stay on it |
+| Producer cohort routing and operator re-route | Not implemented | An unassigned request goes to whichever provider worker claims it first |
+| Shadow resolution mode | Not implemented | Direct resolve currently occurs only while processing a real claim |
+| Manual review workflow | Not implemented | `needs_review` is durable but there is no candidate UI or resume command |
+| Candidate-audit persistence | Not implemented | Score is stored; component reasons and rejected candidates are not |
+| Independent retry budgets by acquisition stage | Not implemented | Metadata, resolution, download, and pre-publication import share one budget; recovery-journal catalog finalization is deliberately unmetered |
+| Matching quality telemetry | Not implemented | Logs exist; metrics and curated-corpus reporting do not |
+| Single playlist owner | Not implemented | One-off and subscribed/dynamic flows remain split |
+| External/owned-file importer | Not implemented | Synchronous import covers provider-created assets only |
 
-### Pinned spotDL CLI
+## Implemented provider contract
 
-This is the lowest-risk bridge, not the destination:
-
-- pin exact `spotdl`, `yt-dlp`, and `yt-dlp-ejs` versions and image digests;
-- install the JavaScript runtime required by that pinned combination;
-- persist and use cache data instead of passing `--no-cache`;
-- use an explicit operation and a wrapper that returns structured JSON;
-- record the final path and source identity rather than waiting for a scan.
-
-spotDL is still active, but its 4.5 releases changed Spotify behavior,
-JavaScript-runtime guidance, and the library's async API. Version isolation is
-therefore essential. See the
-[spotDL release history](https://github.com/spotDL/spotify-downloader/releases).
-
-### spotDL library or sidecar
-
-This retains spotDL's useful candidate matching and metadata work, but keeps the
-same volatile dependency chain while coupling the project to an internal
-Python API. If it is used during transition, isolate it behind a small,
-versioned HTTP or JSON-lines protocol. Do not import it directly into queue
-state logic.
-
-### Direct `yt-dlp`
-
-This removes one layer while preserving the current local-library product
-shape. It also means Harmoniq must own all logic that spotDL previously hid:
-
-- candidate discovery and scoring;
-- live/remix/cover/nightcore/version rejection;
-- duration and edition validation;
-- media extraction and FFmpeg conversion;
-- tag and artwork writing;
-- deterministic paths, checksums, and idempotency;
-- typed handling of unavailable, rejected, and retryable results.
-
-For a Go caller, use stable machine output such as `-J`, `--print`, and
-`--progress-template`; yt-dlp explicitly advises against parsing its normal
-stdout. `--print after_move:filepath` supplies the post-processed path, and a
-download archive can deduplicate source IDs. See the
-[yt-dlp embedding guidance](https://github.com/yt-dlp/yt-dlp/blob/master/README.md#embedding-yt-dlp).
-
-Download into a per-job temporary directory, validate with `ffprobe`, write
-tags, calculate a checksum, and atomically move the completed asset. Streaming
-audio through stdout is a poor fit because this repository needs a durable
-file, stable path, catalog record, and M3U entry.
-
-### Lidarr
-
-Lidarr is an album/library manager built around indexers and Usenet/BitTorrent
-download clients. It can organize and upgrade a library, but it does not
-preserve this repository's Spotify URL, per-track retry, playlist, and Telegram
-queue contract. It becomes attractive only if the product intentionally shifts
-from playlist/track ingestion to album-centric collection management. See the
-[Lidarr project](https://github.com/Lidarr/Lidarr).
-
-### Official playback
-
-If the desired outcome is home playback rather than ownership of files, use
-user OAuth with official Spotify playback surfaces. This removes acquisition,
-indexing, tagging, and M3U generation for Spotify-origin content, but requires
-players that understand Spotify URIs and generally a Premium account. See the
-[Web Playback SDK](https://developer.spotify.com/documentation/web-playback-sdk)
-and [playback-control endpoint](https://developer.spotify.com/documentation/web-api/reference/start-a-users-playback).
-
-### Owned or purchased file import
-
-Spotify metadata can describe wanted tracks without being the acquisition
-mechanism:
-
-1. Resolve a request into a canonical wanted item.
-2. Mark it `awaiting_asset`.
-3. Accept a user-owned or purchased file through a watch folder.
-4. Validate, identify, tag, and import it.
-5. Complete the queue item and regenerate playlists.
-
-This preserves a permanent local library with a clearer provenance boundary,
-at the cost of losing fully automatic acquisition.
-
-Tools that directly log into consumer streaming services to save protected
-content are not recommended as the replacement. They introduce account
-security, authentication, service-policy, and maintenance risks without fixing
-the wrapper's orchestration problems.
-
-## Target contracts
-
-The coordinator should depend on provider-neutral interfaces. One possible Go
-shape is:
+The contract in
+[`pkg/acquisition/types.go`](../spotdl-wapper/pkg/acquisition/types.go)
+separates canonical intent from provider-specific candidates:
 
 ```go
-type TrackSpec struct {
-    SpotifyID string
-    SpotifyURL string
-    ISRC string
-    Artists []string
-    Title string
-    Album string
-    Duration time.Duration
-    Version string
-    Explicit bool
-}
-
-type Candidate struct {
-    Provider string
-    SourceID string
-    URL string
-    Duration time.Duration
-    Score float64
-    Reasons []string
-}
-
-type AssetResult struct {
-    Provider string
-    SourceID string
-    FinalPath string
-    Format string
-    Checksum string
-    MatchScore float64
-}
-
-type AcquisitionProvider interface {
+type Provider interface {
+    Name() ProviderName
     Resolve(context.Context, TrackSpec) ([]Candidate, error)
     Acquire(context.Context, TrackSpec, Candidate) (AssetResult, error)
 }
 ```
 
-`Acquire` must return a structured result. Subprocess exit status and log text
-are diagnostics, not the data contract.
+`TrackSpec` carries canonical Spotify ID/URL, ISRC, artists, title, album,
+duration, explicit flag, version, and allowed variants. `Candidate` carries
+provider/source identity, metadata, score, and audit reasons. `AssetResult`
+returns the concrete staged path, format, checksum, provider/source identity,
+and match score.
 
-Low-confidence resolution should produce `needs_review`, not silently choose
-the first search result. Candidate scoring should use stable IDs where
-available, title and artist normalization, duration difference, edition/version
-markers, and source quality. Live, karaoke, cover, remix, slowed, sped-up, and
-nightcore variants should be rejected unless the requested metadata indicates
-that version.
+The service does not infer success from logs or from a later filesystem scan.
+The shared importer must accept the staged result and return a canonical
+`MusicFile`.
 
-## Target job lifecycle
+## Backend choices
 
-Replace the combination of `active`, `errored`, counters, and implicit
-completion with explicit durable states:
+### Pinned spotDL compatibility provider
 
-```text
-pending
-  -> resolving
-  -> needs_review | downloading
-  -> validating
-  -> imported
-  -> completed
+This is the lowest-risk deployment baseline and current default. It preserves
+spotDL's internal matching while exercising the new leases, per-track
+orchestration, importer, and catalog path.
 
-Any active state -> retry_wait | failed | cancelled
-```
+Its limitations are deliberate:
 
-Claim work with one atomic MongoDB `FindOneAndUpdate` operation that sets a
-worker ID and lease expiry. Renew long-running leases, and allow another worker
-to reclaim an expired lease. Keep the legacy booleans dual-written until
-`album-queue` and `dynamic-playlists` have migrated.
+- spotDL remains a volatile Python/downloader dependency chain;
+- its chosen media source is opaque to the Go worker;
+- its synthetic score of `0` means unscored rather than a rejected match;
+- the current adapter disables spotDL cache;
+- backend assignment happens by first claim rather than a producer-controlled
+  routing policy.
 
-Use separate attempt budgets for:
+Each attempt uses a private staging directory and the shared importer verifies
+the staged checksum, tags and probes the file, publishes it, and updates the
+catalog. The compatibility provider therefore retains spotDL matching without
+giving spotDL ownership of final paths or queue state.
 
-- metadata/API calls;
-- candidate resolution;
-- acquisition;
-- validation/import;
-- playlist materialization.
+See the
+[spotDL release history](https://github.com/spotDL/spotify-downloader/releases)
+for the upstream compatibility changes that motivated isolating and pinning
+this provider.
 
-Indexer lag must never consume an acquisition attempt.
+Keep it until the replacement has met the acceptance criteria and active
+rollback windows have closed. It should not regain ownership of queue or
+library semantics.
 
-## Target library and playlist ownership
+### Direct yt-dlp
 
-The importer should become the single authority for a completed asset:
+This is the integrated replacement candidate when authorized local acquisition
+is a requirement. It removes one abstraction layer but makes this repository
+responsible for:
 
-1. validate codec, duration, and readability;
-2. write canonical tags and provenance;
-3. choose the final deterministic path;
-4. atomically move the file;
-5. upsert `music-files` with Spotify ID/ISRC, source ID, path, checksum, and
-   timestamps;
-6. return the catalog identity to the coordinator.
+- search construction and machine-readable candidate discovery;
+- title, artist, duration, and edition matching;
+- wrong-version rejection;
+- selection confidence and review decisions;
+- extraction and post-processed path discovery;
+- provenance and auditability.
 
-This removes the ambiguous `index-status` timing handshake from the download
-completion path. A separate scanner can remain for externally added or edited
-files, but it should be a tracked, deployable service and not decide whether an
-acquisition attempt succeeded.
+The implementation uses yt-dlp JSON for resolution and
+`after_move:filepath` for acquisition output. It does not parse normal
+human-oriented progress logs. See yt-dlp's
+[embedding guidance](https://github.com/yt-dlp/yt-dlp/blob/master/README.md#embedding-yt-dlp).
 
-Move one-off playlist generation into `dynamic-playlists` or a small dedicated
-materializer. It should consume catalog IDs/paths, write M3Us via temporary file
-plus atomic rename, create parent directories, and safely replace prior output.
-Use distinct settings for the media filename template and playlist directory.
+The current matcher is suitable for a canary, not yet for unattended global
+cutover. It does not distinguish explicit from clean recordings, persist all
+candidate evidence, or expose an operator decision flow. Real-source behavior
+must be measured with an authorized, curated corpus.
 
-## Staged migration
+### Owned or purchased file import
 
-### Phase 0: stabilize the current deployment
+A compliance-oriented local-library path can reuse most of the integrated
+pipeline:
 
-- Stop logging configuration secrets.
-- Determine whether the Spotify app uses Development or Extended Quota Mode.
-- Update the Spotify adapter for current `/items` responses, user OAuth for
-  owned/collaborative playlists, caching, and classified 429 handling.
-- Pin all Python/runtime dependencies and add Deno or the documented runtime
-  for that pinned version.
-- Initialize `index-status` and either track/deploy the indexer or temporarily
-  make its prerequisite explicit.
-- Split `DESTINATION` into media-template and playlist-directory settings.
-- Add subprocess timeouts and cancellation.
+1. Resolve a Spotify request into canonical track specifications.
+2. Transition the track to a new `awaiting_asset` state.
+3. Accept an authorized file from a watch folder or upload boundary.
+4. Identify and compare the file to the wanted track.
+5. Pass it through the existing validator/tagger/importer.
+6. Complete the request and rematerialize affected playlists.
 
-These changes are required regardless of the chosen acquisition backend.
+The missing work is a durable association between an incoming file and a
+`TrackSpec`, an operator-visible ambiguous-match queue, malware/format
+screening appropriate to uploads, and retention rules for rejected inputs.
 
-### Phase 1: characterize and introduce seams
+### Official Spotify playback
 
-- Add fixture/contract tests for existing MongoDB documents.
-- Add an `AcquisitionProvider` interface and put the existing spotDL invocation
-  behind it.
-- Return a structured path/result from the spotDL adapter.
-- Add an atomic claim/lease while dual-writing legacy request state.
-- Run the worker as a normal long-lived process with a ticker and graceful
-  shutdown; retain polling as a fallback.
+If local file ownership is not essential, official Spotify playback removes
+the acquisition, tagging, and file-import problem. It requires user OAuth,
+Spotify-compatible playback clients, and usually Premium. Existing M3U and
+filesystem consumers would need a separate URI-based contract.
 
-No downloader behavior should change yet. This phase creates a rollback-safe
-boundary.
+See the [Web Playback SDK](https://developer.spotify.com/documentation/web-playback-sdk)
+and [playback-control API](https://developer.spotify.com/documentation/web-api/reference/start-a-users-playback).
 
-### Phase 2: introduce canonical identity and import
+This is not selectable through the current `Provider` interface because a
+playback URI is not a staged local asset. Treat it as a deliberate product
+fork, not another downloader adapter.
 
-- Extend track data with Spotify ID, ISRC, album, duration, explicit/version
-  data, source ID, match score, final path, checksum, and typed errors.
-- Backfill what can be derived from historical Spotify URLs and `music-files`.
-- Make the importer write the catalog record synchronously.
-- Move playlist materialization to one owner.
+### Lidarr and a spotDL sidecar
 
-Keep artist/title matching as a legacy fallback, not the primary identity.
+Lidarr is useful for album/library management backed by indexers and download
+clients, but it does not preserve the current Spotify per-track queue,
+provenance, review, and playlist contracts. Adopt it only if the product moves
+to album-centric collection management. See the
+[Lidarr project](https://github.com/Lidarr/Lidarr).
 
-### Phase 3: implement and shadow the replacement
+Embedding spotDL's Python API or introducing a spotDL sidecar would retain the
+same dependency chain while adding another service boundary. If a temporary
+sidecar becomes necessary, keep a small versioned JSON protocol and leave all
+state transitions in the Go coordinator.
 
-For the local-file path, add a direct `yt-dlp` adapter behind a feature flag.
-Initially run only `Resolve` in shadow mode:
+## Required work before a production yt-dlp cutover
 
-- compare its chosen source and confidence with current successful files;
-- do not download or mutate queue state;
-- collect mismatches for remasters, live tracks, collaborations, non-Latin
-  titles, explicit/clean editions, and unavailable tracks.
+### 1. Make backend routing controllable
 
-For the official/import path, use the same phase to prove Spotify playback URIs
-or `awaiting_asset` watch-folder imports.
+Backend affinity itself is durable: a claim accepts work assigned to its
+configured provider or atomically assigns an empty backend, and later retries
+and reclaims retain that value. Remaining routing work is:
 
-### Phase 4: canary and cut over
+- let a producer or routing policy assign the backend before general workers
+  race to claim a new request;
+- define an explicit cohort model for canaries;
+- add an operator action to re-route a paused/failed request and define whether
+  it resets attempt state;
+- record routing changes as audit events;
+- alert when unfinished requests are pinned to a provider with no workers.
 
-- Route a small, explicit request cohort to the new backend.
-- Preserve per-job backend selection so retries use the same implementation.
-- Keep the pinned spotDL adapter as rollback until active legacy jobs drain.
-- Compare success rate, wrong-match rate, duration mismatch, retries, latency,
-  and manual-review rate.
-- Expand only after the canary corpus and crash/restart tests pass.
+Running differently configured workers is safe from cross-provider retry
+drift, but it is not a controlled canary: the first claimant determines the
+backend for every unassigned request. There is no built-in re-route operation.
 
-Finally remove the spotDL package/config mount, compatibility fields, and
-fallback only after historical consumers no longer depend on them.
+### 2. Add review operations
 
-## Minimum acceptance tests
+`needs_review` correctly stops automatic acquisition, but it needs an
+operational interface that can:
 
-Before production cutover, cover:
+- show canonical metadata, all accepted/rejected candidates, scores, and
+  rejection reasons;
+- approve a candidate without changing canonical metadata;
+- reject or cancel the request;
+- edit allowed variant intent when the requested recording is genuinely live,
+  remix, cover, or another alternate;
+- reset the appropriate attempt budget and return the request to `pending`;
+- retain reviewer identity, time, and decision.
 
-- track, album, playlist, and `no_pull` requests;
-- a clean database and a pre-migration database;
-- duplicate URLs and two concurrent workers;
-- crash after claim, during download, and after file move;
+Do not implement review as manually editing MongoDB fields in normal
+operations.
+
+### 3. Persist candidate evidence
+
+Store at least the resolver query, tool/provider version, candidate source ID
+and URL, title/artists/duration/uploader, component scores, rejection reason,
+selection decision, and timestamp. Bound the number and size of candidates to
+avoid unbounded queue documents.
+
+This is necessary for diagnosing wrong matches and comparing a future matcher
+without redownloading.
+
+### 4. Close matching gaps
+
+Extend or explicitly decline support for:
+
+- explicit versus clean editions;
+- remaster/original and radio/full-length edition intent;
+- featured-artist and transliteration normalization;
+- regionally substituted Spotify recordings;
+- missing/incorrect source duration;
+- source/channel trust and audio quality;
+- tracks whose title legitimately contains a strict marker as ordinary text.
+
+Use stable source IDs and known recording IDs where available, but do not
+assume ISRC alone proves that a user-uploaded video contains the exact audio.
+
+### 5. Improve operational safety
+
+Add metrics and alerts for queue depth/age, lease expiry and reclaim, state
+transition counts, provider latency/error rate, review rate, duration mismatch,
+catalog upsert errors, and orphan-file recovery. Add a worker readiness signal
+that verifies MongoDB and configured executable availability without
+downloading content.
+
+Alert specifically on repeated recovery-journal finalization failures. Those
+retries intentionally preserve `WORKER_MAX_ATTEMPTS`, so the worker will not
+turn a valid published artifact into `failed` merely because catalog
+finalization remains unavailable.
+
+Create an orphan reconciler for the remaining publish-before-journal crash
+window. Normal catalog failures are recoverable from the imported
+path/checksum journal, but the filesystem and MongoDB cannot make publication
+and that first journal write one transaction. Reconciliation must use checksums
+and canonical IDs and must never blindly delete files. Private staging attempts
+already have bounded cleanup.
+
+### 6. Finish playlist consolidation
+
+Move one-off and subscribed/dynamic playlists behind one materialization
+contract, or give each clearly disjoint ownership. The one-off queue should
+gain claims/leases and should wait on the exact missing track jobs. Missing
+files now wait without consuming retry count or writing a partial
+non-`no_pull` M3U, but a suppressed/review/successful dependency with no usable
+catalog file can still leave the playlist active forever. Ensure playlist work
+also receives fair scheduling when downloads are continuously available.
+
+## Rollout plan
+
+### Stage A: deploy the new coordinator with spotDL
+
+Keep `ACQUISITION_BACKEND=spotdl`. This changes orchestration and import while
+retaining the familiar acquisition engine.
+
+Before deployment:
+
+- back up MongoDB and the library metadata needed for recovery;
+- verify staging, media, and playlist paths are writable by UID 10001;
+- verify the spotDL config mount in both configured locations;
+- inspect duplicate Spotify IDs that could prevent the unique sparse identity
+  index; duplicate checksums are valid and the checksum index is non-unique;
+- configure a Spotify refresh token when Development Mode playlist access is
+  required;
+- record the current container image identifier and environment for rollback.
+
+During the soak, verify request leases, retry scheduling, imported paths/tags,
+catalog identities, recovery from a failed catalog upsert without
+reacquisition, multi-track resume, and playlist replacement. Do not enable
+direct yt-dlp merely because the process is stable; matching needs separate
+validation.
+
+### Stage B: build a non-mutating comparison path
+
+Add a shadow resolver that reads a representative sample of completed
+canonical tracks and executes direct yt-dlp `Resolve` without claiming jobs,
+downloading files, or mutating queue state.
+
+Compare the top candidate against known-good files for:
+
+- studio/live and original/remix boundaries;
+- remasters, edits, acoustic, instrumental, covers, slowed/sped-up/nightcore;
+- multiple artists, punctuation, transliteration, and non-Latin titles;
+- explicit/clean releases;
+- unavailable, regional, and metadata-incomplete tracks.
+
+Store bounded comparison results outside active request state. Define an
+acceptable wrong-match rate and review rate before proceeding.
+
+### Stage C: route an explicit canary
+
+Implement producer-controlled backend assignment or a routing service first.
+Route only a small, auditable cohort of authorized requests to `yt-dlp`; leave
+all other work on spotDL. First-claim pinning prevents retry drift but cannot
+select this cohort by itself.
+
+Recommended gates:
+
+- no automatic cross-provider fallback;
+- a functioning review/resume operation;
+- curated-corpus results accepted by an operator;
+- alarms for stuck leases, elevated retries, and review-rate changes;
+- verified file/catalog recovery after termination at every state boundary;
+- provenance and the exact provider/tool version visible per imported track.
+
+Increase the cohort gradually. Compare successful import rate, manual-review
+rate, confirmed wrong-match rate, retry distribution, duration mismatch,
+latency, and storage effects—not just downloader exit status.
+
+### Stage D: make yt-dlp primary
+
+Only after the canary gates hold, route new authorized local-file requests to
+yt-dlp by default. Keep spotDL installed and pinned for a defined rollback
+period, but do not automatically invoke it when direct resolution fails.
+
+Drain or intentionally re-route spotDL-assigned jobs. Document who may
+re-route a job and whether doing so resets attempts. Continue to support
+`needs_review`; a lower success rate can be safer than a higher wrong-match
+rate. Until an audited re-route operation exists, keep a spotDL worker
+available for spotDL-pinned unfinished jobs or explicitly cancel and resubmit
+them as newly routed work.
+
+### Stage E: retire spotDL
+
+Remove spotDL only when:
+
+- no active/retry/review job is assigned to it;
+- historical provenance is readable without the executable;
+- the rollback window has expired;
+- the direct or owned-file path meets the agreed quality and legal policy;
+- container, Compose, configuration, and operator docs no longer reference its
+  config mounts;
+- an image without spotDL passes the full acceptance suite.
+
+Remove compatibility fields and dead indexer code separately. They have
+different consumers and should not be bundled into the downloader removal.
+
+## Rollback
+
+### Current implementation
+
+Backend affinity must be preserved during rollback:
+
+1. Stop yt-dlp workers so they stop claiming unassigned requests and gracefully
+   release interrupted yt-dlp claims.
+2. Preserve MongoDB and the library; do not delete imported files, clear
+   backend values, or rewrite catalog provenance.
+3. Before starting another worker, inventory all unassigned requests plus
+   yt-dlp-pinned `claimed`, expired-lease, `retry_wait`, `needs_review`, and
+   failed requests. Approve, cancel, or otherwise account for every unassigned
+   request so it cannot race the provider transition.
+4. Keep or start a worker with `ACQUISITION_BACKEND=spotdl` and the last
+   known-good pinned image/config. It can claim unassigned and spotDL-pinned
+   work, but correctly will not take yt-dlp-pinned work.
+5. For each unfinished yt-dlp-pinned request, deliberately choose to let a
+   yt-dlp worker finish it, cancel and resubmit it while only spotDL workers can
+   claim the new unassigned work, or use a future audited re-route operation.
+
+There is no built-in re-route operation today. Do not implement rollback by
+blindly clearing or replacing `backend`: doing so discards the affinity
+guarantee and obscures acquisition history.
+
+Files already imported by yt-dlp remain valid catalog entries with yt-dlp
+provenance. Rollback must not pretend they came from spotDL.
+
+### After controlled routing is added
+
+Stop assigning new work to yt-dlp, allow safe in-flight jobs to finish or
+cancel them through queue state, and route new work to spotDL. Leave existing
+yt-dlp-assigned retry/review jobs pinned unless an operator explicitly
+re-routes them. Rollback should be a routing change, not a database restore.
+
+## Data compatibility
+
+The download state machine is additive. Legacy documents without `state` are
+claimable as pending, and the worker dual-writes `active`/`errored` for existing
+readers. New producers create `state=pending`.
+
+Before removing compatibility:
+
+- update every consumer to interpret explicit state;
+- distinguish `retry_wait` from `needs_review` in user-facing queue output;
+- stop using `active` alone as success or failure;
+- retain the ability to resubmit `failed` and `cancelled` work intentionally;
+- backfill stable Spotify identity where reliable;
+- resolve legacy duplicate Spotify IDs before enforcing the sparse unique
+  Spotify-ID index;
+- preserve legitimate duplicate checksums; the checksum index is intentionally
+  non-unique, and decide separately whether ISRC or path should become unique;
+- decide how much historical candidate/result/error data to retain.
+
+`music-files` should keep source provenance permanently. A future provider
+change must update mutable metadata without erasing the original source
+identity accidentally.
+
+The download precheck now matches Spotify ID, then ISRC, then identity-less
+legacy artist/title and validates the referenced file and optional checksum.
+The database upsert itself builds its filter from only the first non-empty
+input identity—Spotify ID, otherwise ISRC, otherwise path—so reconciliation
+must not assume it performs sequential fallback lookups.
+
+## Acceptance criteria
+
+Before making a replacement provider primary, test:
+
+- track, album, playlist, empty/unavailable playlist items, and `no_pull`;
+- clean database, legacy state-less documents, and duplicate legacy catalog
+  data;
+- two workers with the same and different providers, first-claim backend
+  pinning, lease expiry/reclaim, random claim fencing, and stale-attempt write
+  rejection;
+- termination after claim, during resolve/download/tag/probe, after publish
+  before the recovery journal, after the journal, after catalog upsert, and
+  after per-track progress;
+- scheduled retry, direct-endpoint Spotify `Retry-After`, SDK status
+  normalization, acquisition-attempt exhaustion, budget-preserving
+  recovery-journal finalization retries, review, cancel, approve, and explicit
+  provider re-route;
 - unavailable and region-restricted tracks;
-- explicit/clean, live/studio, remix/original, remaster, and cover ambiguity;
-- multiple artists and non-Latin/special-character metadata;
-- index/import delay without consuming download attempts;
-- redownload after skipped or failed history;
-- filesystem permissions and out-of-space behavior;
-- deterministic tags, final paths, checksums, and idempotent M3U replacement.
+- explicit/clean, live/studio, remix/original, remaster, acoustic,
+  instrumental, cover/karaoke, slowed/sped-up/nightcore, and radio/full edit
+  ambiguity;
+- multiple artists, punctuation, non-Latin metadata, and malicious path/title
+  characters;
+- incorrect source duration, provider-checksum mismatch, corrupt/empty media,
+  all six configured output formats, unsupported codec, no space, permissions,
+  and read-only mounts;
+- deterministic tags, artwork policy, `0640` modes, paths, checksums, collision
+  behavior, component-length bounds, OGG/Opus retry determinism, sync
+  boundaries, discard, orphan-attempt cleanup, and idempotent reprocessing;
+- complete, `no_pull` partial, empty, missing-file wait, and replacement M3Us;
+- container startup checks and a real MongoDB/tool end-to-end path.
 
-## Open product decisions
+Success means a correct, auditable library artifact—not merely a zero
+subprocess exit code.
 
-Implementation should not start until these are explicit:
+## Product decisions still required
 
-1. Must Spotify-origin requests end as permanent local files, or is official
-   playback acceptable?
-2. If files are required, what sources is the deployment authorized to use?
-3. Which output formats, bitrate/quality floor, tag schema, and path layout are
-   contractual?
-4. May low-confidence matches wait for manual review?
-5. Should historical inactive failures be retried automatically after
-   migration?
+1. Must Spotify-origin requests end as permanent local files, or can they end
+   as official playback URIs?
+2. Which media sources and content is this deployment authorized to use?
+3. Which formats, codec/bitrate floor, tags, artwork, loudness, and path layout
+   form the library contract?
+4. What wrong-match and review rates are acceptable?
+5. Who may approve, cancel, or re-route a request, and how is that decision
+   audited?
+6. Should externally added owned files become a first-class acquisition path?
+7. Which service owns all playlist materialization?
 
-The first answer chooses the backend family. The remaining answers define the
-acceptance contract; they should not be delegated to whichever downloader
-happens to be installed.
+The first two questions choose the valid backend family. The remaining answers
+define whether the integrated direct provider is ready to move beyond a
+canary.
