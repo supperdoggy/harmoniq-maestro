@@ -2,13 +2,17 @@
 
 This runbook compares the `music-services` VM observed on 2026-08-01 with the
 provider-neutral `spotdl-wapper` implementation in this repository and defines
-a safe migration path. It is a deployment plan, not evidence that the steps
-have been performed.
+a safe migration path. The procedural sections remain the reusable deployment
+and rollback plan. Stage A was performed on 2026-08-03; its authoritative
+post-cutover topology and evidence are recorded in
+[`vm-infrastructure-production-state.md`](./vm-infrastructure-production-state.md).
 
 Read these companion documents first:
 
 - [`vm-infrastructure-current-state.md`](./vm-infrastructure-current-state.md)
-  is the read-only, as-built VM snapshot;
+  is the immutable read-only, pre-migration VM snapshot;
+- [`vm-infrastructure-production-state.md`](./vm-infrastructure-production-state.md)
+  is the current post-cutover production record;
 - [`spotdl-wapper-current-state.md`](./spotdl-wapper-current-state.md) describes
   the implemented worker lifecycle and storage contracts;
 - [`spotdl-wapper-migration.md`](./spotdl-wapper-migration.md) records the
@@ -25,14 +29,18 @@ Treat the change as two migrations with separate rollback boundaries:
 2. Validate and later promote the direct `yt-dlp` provider only after routing,
    review, audit, and matching-quality gates are satisfied.
 
+The first migration is deployed. Production keeps spotDL primary inside the
+new worker container. The second migration has not begun: direct `yt-dlp`
+remains an opt-in implementation and Stages B through D are future work.
+
 Do **not** deploy the repository's root `docker-compose.yml` unchanged on this
 VM. The first production change should be a worker-only deployment that keeps:
 
 - the existing remote MongoDB and, after direct verification, its live
   database/collection contract;
 - the existing `/mnt/music` path inside and outside the container;
-- the current queue producer and dynamic-playlist deployment until they are
-  migrated as separate changes;
+- the current queue producer; retain the dynamic-playlist deployment assets but
+  leave that workload disabled until it is migrated as a separate change;
 - spotDL as the initial acquisition provider and rollback path.
 
 The direct `yt-dlp` backend is implemented, but the current system cannot route
@@ -52,9 +60,9 @@ must be an exclusive, maintenance-window switch.
 | MongoDB | Remote endpoint at `100.111.149.52:27017`; no local MongoDB container; exact live database/collection use was not queried | Verify and preserve the same remote database and collections for the first migration |
 | Library | CIFS share at `/mnt/music`; downloads under `/mnt/music/Job-downloaded` | Bind `/mnt/music` to the identical container path and preserve the catalog namespace |
 | Staging | Legacy spotDL behavior | Dedicated host-local staging at `/var/lib/harmoniq/staging` |
-| Runtime identity | Root-owned binary running as root | Container UID/GID 10001; NAS access must be proved before cutover |
-| Configuration | Secrets embedded in root wrapper assignments; config under `/root/.spotdl` | Root-only environment files and read-only spotDL config mounts |
-| Artifact provenance | Copied February 2026 binary with a recorded hash but no source revision | Immutable Linux/amd64 image digest built from a clean, recorded commit |
+| Runtime identity | Root-owned binary running as root | Container explicitly runs as UID/GID 1000 to match the CIFS mapping; the image default remains 10001 |
+| Configuration | Secrets embedded in root wrapper assignments; config under `/root/.spotdl` | Root-only environment files, read-only canonical spotDL config, and narrowly scoped writable temp/runtime-cookie overlays |
+| Artifact provenance | Copied February 2026 binary with a recorded hash but no source revision | Source-mapped Linux/amd64 image identified by exact image ID and source-archive checksum; use a registry digest when available |
 | Logging | Cron mail, host output, and application Loki | Docker/journald initially; application Loki only after container-network validation |
 | Health | Cron invocation proves only that the command started | Container state, logs, MongoDB state transitions, and artifact checks; no worker readiness endpoint exists yet |
 
@@ -63,6 +71,23 @@ That proves only enqueue-format compatibility; it does not prove that the
 source-unmapped, unhealthy queue bot will avoid later writes that conflict with
 leases or display every new state correctly. Keep general access paused until
 its full MongoDB behavior is verified during the canary.
+
+### Stage A as deployed
+
+The deployed worker-only project is `/opt/harmoniq-worker/compose.yml`. It uses
+source revision `66249d8352029c4c1f4bb8207b61950aa326d714` and image
+`harmoniq-spotdl-wapper:66249d835202-amd64` with image ID
+`sha256:0c50782a027f8ff2dc6935a7652340422c0b66f35d2e4a80e7683b4bc4250bea`.
+The transferred source archive SHA-256 is
+`33936b1c88c40749b667447d2461af845d6995583b4ba9208c380ff24d883fbb`.
+
+The worker, Telegram queue bot, and n8n are running. The old acquisition
+worker, indexer, and dynamic-playlist cron entries remain present for rollback
+but have zero enabled entries; the indexer and dynamic-playlists processes are
+stopped. The worker-only Compose project does not start MongoDB, a queue bot,
+an indexer, or dynamic playlists and publishes no network port. spotDL is not
+invoked on the host: the Go coordinator starts the pinned spotDL CLI as a child
+process inside the worker container.
 
 ## Why the repository Compose file is not the VM manifest
 
@@ -94,19 +119,19 @@ flowchart LR
     nas[("NAS CIFS share")]
 
     subgraph vm["music-services VM"]
-        queue["Existing telegram queue bot"]
-        dynamic["Existing dynamic-playlists cron"]
-        worker["Provider-neutral worker container\nbackend = spotdl"]
+        queue["Existing standalone Telegram queue bot"]
+        disabled["Legacy acquisition/indexer/dynamic cron\ndisabled"]
+        worker["Worker container\nGo coordinator + spotDL CLI\nbackend = spotdl"]
         staging[("Local staging\n/var/lib/harmoniq/staging")]
         mount["/mnt/music"]
+        n8n["Existing n8n container"]
     end
 
     queue --> mongo
-    dynamic --> mongo
-    dynamic --> mount
     worker --> mongo
     worker --> staging
     worker --> mount
+    n8n --> mount
     mount --> nas
 ```
 
@@ -150,6 +175,12 @@ The observed CIFS mount maps files to UID/GID 1000, while the worker image runs
 as UID/GID 10001. Root's ability to write through the legacy binary does not
 prove that the container can write.
 
+Stage A resolved this mismatch by explicitly running the production container
+as `1000:1000`. The image still defaults to `10001:10001`; every production
+probe must therefore apply the Compose identity instead of relying on the image
+default. Host-local staging and writable spotDL runtime paths are owned by
+`1000:1000`, while canonical configuration remains root-owned and read-only.
+
 Choose and document one of these approaches:
 
 - grant UID/GID 10001 the required NAS directories through a verified NAS ACL
@@ -162,6 +193,12 @@ Choose and document one of these approaches:
 Do not make the entire share world-writable. A Compose `user: 1000:1000`
 override is not automatically safe: the image's home, Deno cache, and spotDL
 paths were created for UID 10001 and must also be made consistent.
+
+The deployed manifest makes the required spotDL state explicit: it overlays a
+private writable temp directory and runtime cookie file at both of spotDL's
+supported config locations. It does not make the canonical config directory or
+cookie source writable. Deno and the selected `web_music` client were verified
+through the production container before the accepted canary.
 
 The real CIFS mount must support every operation used by the importer:
 
@@ -197,6 +234,12 @@ Record the observed `findmnt` source and mount options. Every manual or
 automated start must check both `findmnt` and the sentinel before Compose is
 invoked. The manifest also checks the sentinel inside the container, which
 protects Docker restart-policy starts that bypass the host preflight.
+
+For Stage A, `/mnt/music` was remounted from `//nascore/media/Music` with
+UID/GID `1000`, `file_mode=0640`, `dir_mode=0750`, and
+`nosuid,nodev,noexec`. The sentinel is NAS-resident and also over-mounted
+read-only at the same path inside the container, so the worker can test it but
+cannot modify it through the otherwise writable library bind.
 
 Arrange the VM's eventual startup unit after `remote-fs.target`, Docker,
 Tailscale, and the `/mnt/music` mount. Test the missing-mount boot path in a
@@ -287,13 +330,13 @@ Do not call a backup verified solely because its creation command exited zero.
 | Dynamic output `/mnt/music/Job-downloaded/Playlists/` | `PLAYLISTS_OUTPUT_PATH=/mnt/music/Job-downloaded/Playlists` | Confirm one-off and dynamic ownership |
 | No explicit private staging | `ACQUISITION_STAGING_PATH=/var/lib/harmoniq/staging` | Host-local bind mount, owned by the runtime UID |
 | spotDL only | `ACQUISITION_BACKEND=spotdl` | First stage and rollback-compatible baseline |
-| Current media format from uninspected config | `ACQUISITION_AUDIO_FORMAT=mp3` in the example | Replace with the observed value if different |
+| Current media format from the copied config and accepted canary | `ACQUISITION_AUDIO_FORMAT=m4a` | The accepted canary produced and validated AAC audio in an M4A container |
 | Hourly cron plus 55-minute whole-process timeout | Long-running service; `WORKER_POLL_INTERVAL=1m`, initially `ACQUISITION_COMMAND_TIMEOUT=55m` | The new timeout is per downloader/FFmpeg/FFprobe command, so the semantics are not identical; measure and tighten it after the compatibility soak |
 | `SLEEP_IN_MINUTES=0` | `SLEEP_IN_MINUTES=0` | Preserve current no-delay behavior between requests |
-| `/root/.spotdl/config.json` | Read-only directory mounted at both supported container paths | `SPOTDL_USE_CONFIG=true` is a boolean, not a file path |
+| `/root/.spotdl/config.json` | Root-owned read-only canonical copy mounted at both supported container paths | `SPOTDL_USE_CONFIG=true` is a boolean, not a file path; writable temp and runtime-cookie overlays are separate |
 | `BLOB_ENABLED=false` | Remove | The new worker does not consume this setting |
 | Loki enabled at `dashboard:3100` | Start with `LOKI_ENABLED=false`, then enable after container DNS/routing validation | Docker already logs to journald; avoid losing or duplicating logs |
-| Root execution | UID/GID 10001 | Resolve the CIFS identity blocker first |
+| Root execution | Production UID/GID 1000; image default 10001 | The Compose override, staging ownership, config readability, temp directory, cookie file, and NAS mapping must be tested together |
 
 The new worker also requires explicit lease, retry, matching, FFmpeg, and
 Spotify settings. Do not depend on `.env.example` defaults in production.
@@ -343,30 +386,52 @@ docker run --rm \
   -ec 'id; spotdl --version; yt-dlp --version; deno --version; ffmpeg -version; ffprobe -version'
 ```
 
-The expected runtime identity is UID/GID 10001. Record the tool versions in the
-change evidence.
+The image-default runtime identity is UID/GID 10001. The production Compose
+manifest overrides it to UID/GID 1000, so repeat the smoke check with
+`--user 1000:1000` and the production mounts before granting data access.
+Record both identities and the tool versions in the change evidence.
 
 Prepare dedicated host paths without changing the NAS mount itself:
 
 ```bash
 install -d -o 0 -g 0 -m 0700 /etc/harmoniq
-install -d -o 0 -g 10001 -m 0750 /etc/harmoniq/spotdl
+install -d -o 0 -g 1000 -m 0750 /etc/harmoniq/spotdl
 install -d -o 0 -g 0 -m 0750 /opt/harmoniq-worker
-install -d -o 10001 -g 10001 -m 0750 /var/lib/harmoniq/staging
+install -d -o 1000 -g 1000 -m 0750 /var/lib/harmoniq/staging
+install -d -o 1000 -g 1000 -m 0750 /var/lib/harmoniq/spotdl-temp
+install -d -o 1000 -g 1000 -m 0700 /var/lib/harmoniq/spotdl-runtime
 install -d -o 0 -g 0 -m 0700 /var/backups/harmoniq
 ```
 
-Numeric group `10001` is deliberate even if the guest has no named group with
-that ID; it matches the image's `appuser` group. Copy the existing spotDL
-configuration without printing it, then make it group-readable by only the
-container identity:
+Numeric group `1000` matches the established CIFS identity used by the
+production Compose override. Copy the existing spotDL configuration without
+printing it, then make it group-readable by only the container identity:
 
 ```bash
 test ! -e /etc/harmoniq/spotdl/config.json
-install -o 0 -g 10001 -m 0440 \
+install -o 0 -g 1000 -m 0440 \
   /root/.spotdl/config.json \
   /etc/harmoniq/spotdl/config.json
 ```
+
+If the inspected configuration uses a cookie file, retain a root-owned
+canonical copy and give the downloader a distinct private runtime copy. yt-dlp
+may update the cookie jar when it exits, so mounting the canonical file itself
+writable would defeat the immutable-input boundary:
+
+```bash
+install -o 0 -g 1000 -m 0440 \
+  /root/.spotdl/cookies.txt \
+  /etc/harmoniq/spotdl/cookies.txt
+install -o 1000 -g 1000 -m 0600 \
+  /etc/harmoniq/spotdl/cookies.txt \
+  /var/lib/harmoniq/spotdl-runtime/cookies.txt
+```
+
+The production config copy translates the legacy JavaScript runtime to Deno
+and selects the `web_music` YouTube player client. The rollback source under
+`/root/.spotdl` remains unchanged. Treat both cookie copies as credentials;
+never print, checksum into public logs, or commit their contents.
 
 ## Worker-only production manifest
 
@@ -379,8 +444,10 @@ name: harmoniq-worker
 
 services:
   spotdl-wapper:
-    image: ${HARMONIQ_WORKER_IMAGE:?set an immutable image reference}
+    image: ${HARMONIQ_WORKER_IMAGE:?set the exact image reference}
+    pull_policy: never
     container_name: harmoniq-spotdl-wapper
+    user: "1000:1000"
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-ec"]
     command:
@@ -392,6 +459,10 @@ services:
         source: /mnt/music
         target: /mnt/music
       - type: bind
+        source: /mnt/music/.harmoniq-nas-sentinel
+        target: /mnt/music/.harmoniq-nas-sentinel
+        read_only: true
+      - type: bind
         source: /var/lib/harmoniq/staging
         target: /var/lib/harmoniq/staging
       - type: bind
@@ -399,9 +470,21 @@ services:
         target: /home/appuser/.config/spotdl
         read_only: true
       - type: bind
+        source: /var/lib/harmoniq/spotdl-temp
+        target: /home/appuser/.config/spotdl/temp
+      - type: bind
+        source: /var/lib/harmoniq/spotdl-runtime/cookies.txt
+        target: /home/appuser/.config/spotdl/cookies.txt
+      - type: bind
         source: /etc/harmoniq/spotdl
         target: /home/appuser/.spotdl
         read_only: true
+      - type: bind
+        source: /var/lib/harmoniq/spotdl-temp
+        target: /home/appuser/.spotdl/temp
+      - type: bind
+        source: /var/lib/harmoniq/spotdl-runtime/cookies.txt
+        target: /home/appuser/.spotdl/cookies.txt
     stop_grace_period: 30s
     security_opt:
       - no-new-privileges:true
@@ -416,8 +499,13 @@ services:
 Put only the image reference in `/etc/harmoniq/deploy.env`:
 
 ```dotenv
-HARMONIQ_WORKER_IMAGE=registry.example/harmoniq/spotdl-wapper@sha256:<digest>
+HARMONIQ_WORKER_IMAGE=harmoniq-spotdl-wapper:66249d835202-amd64
 ```
+
+The VM-local tag is accepted only together with `pull_policy: never`, the
+recorded source archive checksum, and verification that it resolves to image ID
+`sha256:0c50782a027f8ff2dc6935a7652340422c0b66f35d2e4a80e7683b4bc4250bea`.
+A registry digest remains preferable for a future release.
 
 Create `/etc/harmoniq/spotdl-wapper.env` as root-owned mode `0600`. The initial
 compatibility configuration is:
@@ -432,7 +520,7 @@ SPOTIFY_CLIENT_SECRET=<secret>
 SPOTIFY_REFRESH_TOKEN=
 
 ACQUISITION_BACKEND=spotdl
-ACQUISITION_AUDIO_FORMAT=mp3
+ACQUISITION_AUDIO_FORMAT=m4a
 ACQUISITION_COMMAND_TIMEOUT=55m
 ACQUISITION_STAGING_PATH=/var/lib/harmoniq/staging
 
@@ -498,20 +586,25 @@ docker compose \
 
 Retain the original `/root/.spotdl/config.json` and its checksum unchanged
 through the legacy rollback window. Verify that the mounted copy is readable,
-but not writable, by UID 10001. Review it for host-only absolute paths,
+but not writable, by production UID 1000. Review it for host-only absolute paths,
 cookies, proxy settings, output overrides, and cache locations; translate or
 mount each required dependency deliberately rather than assuming `/root/...`
 exists in the container.
 
-Verify both read-only inputs as the image's default user:
+Verify the read-only boundaries and narrowly writable runtime paths as the
+actual production user:
 
 ```bash
 docker run --rm \
+  --user 1000:1000 \
   --mount type=bind,source=/mnt/music,target=/mnt/music \
+  --mount type=bind,source=/mnt/music/.harmoniq-nas-sentinel,target=/mnt/music/.harmoniq-nas-sentinel,readonly \
   --mount type=bind,source=/etc/harmoniq/spotdl,target=/home/appuser/.config/spotdl,readonly \
+  --mount type=bind,source=/var/lib/harmoniq/spotdl-temp,target=/home/appuser/.config/spotdl/temp \
+  --mount type=bind,source=/var/lib/harmoniq/spotdl-runtime/cookies.txt,target=/home/appuser/.config/spotdl/cookies.txt \
   --entrypoint sh \
-  registry.example/harmoniq/spotdl-wapper@sha256:<digest> \
-  -ec 'test -r /mnt/music/.harmoniq-nas-sentinel; test -r /home/appuser/.config/spotdl/config.json; test ! -w /home/appuser/.config/spotdl/config.json'
+  harmoniq-spotdl-wapper:66249d835202-amd64 \
+  -ec 'test -r /mnt/music/.harmoniq-nas-sentinel; test ! -w /mnt/music/.harmoniq-nas-sentinel; test -r /home/appuser/.config/spotdl/config.json; test ! -w /home/appuser/.config/spotdl/config.json; test -w /home/appuser/.config/spotdl/temp; test -w /home/appuser/.config/spotdl/cookies.txt'
 ```
 
 Before starting the worker, verify that a container on the VM can reach the
@@ -544,13 +637,14 @@ identifier so concurrent or abandoned preflights cannot collide:
 
 ```bash
 docker run --rm \
+  --user 1000:1000 \
   --mount type=bind,source=/mnt/music,target=/mnt/music \
   --security-opt no-new-privileges \
   --cap-drop ALL \
   --entrypoint sh \
-  registry.example/harmoniq/spotdl-wapper@sha256:<digest> \
+  harmoniq-spotdl-wapper:66249d835202-amd64 \
   -ec '
-    d=/mnt/music/Job-downloaded/.harmoniq-preflight-10001-change-id
+    d=/mnt/music/Job-downloaded/.harmoniq-preflight-1000-change-id
     test ! -e "$d"
     mkdir "$d"
     cleanup() {
@@ -849,7 +943,15 @@ Use a recorded database-tools image version/digest compatible with the live
 MongoDB server. Copy or replicate the backup outside this guest and complete
 the isolated restore drill before continuing.
 
-## Stage A: deploy the new coordinator with spotDL
+Stage A execution produced a final MongoDB archive and restored it into an
+isolated target: seven collections and 19,985 documents were restored. The
+legacy wrappers, crontab, production manifest, configuration, and playlist
+state also have protected change-specific backups under
+`/var/backups/harmoniq`. No full NAS snapshot was available. That is a recorded
+recovery gap, not a completed NAS-restore gate; imported media must not be
+represented as covered by the MongoDB archive alone.
+
+## Stage A: deploy the new coordinator with spotDL — deployed
 
 This is the first production baseline. Do not set `ACQUISITION_BACKEND=yt-dlp`
 yet. “Compatibility” refers to the provider boundary, not binary equivalence:
@@ -857,6 +959,50 @@ the live spotDL/tool versions were not captured, while the new image also adds
 per-track orchestration, FFmpeg tagging/validation, a new filename template,
 atomic publication, and synchronous cataloging. Compare actual matching and
 output as part of acceptance.
+
+The accepted deployment uses source revision
+`66249d8352029c4c1f4bb8207b61950aa326d714` and the image recorded above. Its
+first bounded track canary produced this evidence:
+
+| Evidence | Result |
+| --- | --- |
+| Queue request | `b172653c-ea77-48d6-8d77-c04a356f112a` |
+| Final lifecycle | `completed`, `active=false`, `backend=spotdl`, `retry_count=1` |
+| Spotify/source ID | `03jnWnj2qOrYofsyCTuHC6` |
+| Catalog ID | `e9c11aaf-2227-4b58-9af3-21fe45035de5` |
+| Catalog cardinality | 19,766 documents total; exactly one row for the Spotify ID |
+| Published path | `/mnt/music/Job-downloaded/benny the butcher, freddie gibbs - one way flight (feat. freddie gibbs).m4a` |
+| Published asset | 11,235,648 bytes; mode `0640`; UID/GID `1000:1000` |
+| Media probe | AAC, 44.1 kHz, stereo, duration 198.996 seconds |
+| SHA-256 | `13efc86a52a68db647b722deccafc03b4a5b9c5f58ffc93e450ddd93a9eed912` |
+| Staging after import | Empty |
+
+The retry count was deliberately preserved rather than rewriting the canary's
+failure history. Before acceptance, the canary exposed several integration
+problems that made the queue appear not to advance:
+
+1. The all-read-only spotDL config mount prevented spotDL from creating its
+   temporary state. The manifest now provides a dedicated writable temp bind.
+2. The copied legacy config selected Node even though the pinned image carries
+   Deno. The production copy selects Deno; the rollback source is unchanged.
+3. yt-dlp writes its cookie jar on close and failed against the canonical
+   read-only file. It now receives a private mode-`0600` runtime copy, while
+   the canonical cookie remains read-only, and uses the verified `web_music`
+   player client.
+4. spotDL 4.5.2 sanitizes every dot-prefixed path component. It changed a
+   marked `.harmoniq-attempt-*` path into an unmarked sibling, downloaded a
+   valid asset there, and left the wrapper checking the original path. The
+   current `harmoniq-attempt-*` prefix and non-dot production staging root
+   avoid that rewrite. The importer still accepts legacy marked attempts, but
+   never adopts or deletes an unmarked sanitized sibling automatically.
+
+Exact unmarked diagnostic/canary residues were inventoried and moved intact to
+`/var/backups/harmoniq/66249d835202/worker-upgrade/staging-residue.before`
+before the corrected canary was replayed. They were not adopted as a valid
+import. Production staging was empty for the replay and remained empty after
+completion. The generic repository default was also changed away from
+`/music/.staging`, and the spotDL provider now rejects any dot-prefixed staging
+component before running the tool.
 
 1. Keep all producers paused, both queues free of eligible work, and the old
    worker/indexer cron entries disabled.
@@ -899,6 +1045,13 @@ docker logs --since 15m harmoniq-spotdl-wapper
 
 There is no readiness endpoint. A running container is necessary but not
 sufficient.
+
+After acceptance, both `harmoniq-spotdl-wapper` and the existing Telegram bot
+were running with restart count zero, and n8n remained running. Docker still
+labels the queue bot unhealthy because its pre-existing HTTP healthcheck is
+broken; the `./main` process is running and its successful insertion of the
+canary proves the enqueue path independently. The legacy indexer and dynamic
+playlists remain stopped and their cron entries remain disabled.
 
 For every canary, verify:
 
@@ -1134,8 +1287,9 @@ deleted automatically.
 
 - Keep legacy cron entries commented and binaries intact through the rollback
   window; archive their hashes and remove them only after formal acceptance.
-- Rotate credentials where appropriate after moving them out of legacy
-  wrappers.
+- Rotate the MongoDB, SMB, and Spotify credentials after moving them out of
+  legacy wrappers, and refresh the sensitive downloader cookie jar through a
+  controlled procedure. Do not copy secret values into the change record.
 - Decide how n8n and other external files enter the catalog without the legacy
   indexer.
 - Add worker readiness, metrics, queue-age alerts, provider error rates, and
@@ -1153,27 +1307,42 @@ deleted automatically.
   database migration is approved.
 - Define bounded retention for journald, the legacy indexer log, and root mail.
 
-## Assumptions requiring live verification
+## Verification status after Stage A
 
-The current-state audit deliberately avoided active workload probes. This
-runbook therefore treats all of the following as unverified gates:
+The 2026-08-01 audit deliberately avoided active workload probes. Stage A
+subsequently verified that:
 
 - Docker bridge traffic can reach `100.111.149.52:27017` through the VM's
   Tailscale routing;
 - Docker bridge DNS/TLS can reach Spotify and the source/proxy endpoints
   required by the inspected spotDL configuration;
 - MongoDB credentials allow the required collection and index operations;
-- MongoDB and NAS backups exist outside the guest and can be restored;
 - CIFS supports the importer's permissions, hard links, replacement, and sync
-  behavior for the chosen container identity;
+  behavior for UID/GID 1000;
 - current catalog rows use the `/mnt/music/...` namespace consistently;
-- `mp3` and the example output template match the desired library contract;
-- the existing queue bot handles the additive state model correctly;
-- external NAS writers have been identified and have a replacement cataloging
-  path;
-- the legacy and one-off playlist writers do not overwrite the same files;
+- M4A and the deployed output template produce a playable, cataloged mode-0640
+  artifact;
+- the existing queue bot can enqueue a legacy-shaped request and does not
+  prevent the worker from completing it;
+- the reviewed image-transfer path produces the recorded source checksum and
+  image ID.
+
+The following remain unresolved or only partially verified:
+
+- the MongoDB archive restored successfully, but no full NAS snapshot or NAS
+  restore drill was available;
+- one successful queue-bot canary does not prove every additive lifecycle
+  state is rendered or left untouched correctly;
+- external NAS writers are not yet fully inventoried and no replacement
+  cataloging path has been implemented;
+- the legacy and one-off playlist writers have not yet been proved to own
+  disjoint paths, so dynamic playlists remain stopped;
 - `dashboard:3100` resolves and accepts Loki traffic from the Docker bridge;
-- a trusted registry or verified image-transfer path is available.
+- the VM-local image is identified by an exact image ID and source archive,
+  but a registry digest and off-guest retained image artifact are still
+  preferable;
+- readiness, queue-depth, staging-capacity, mount-loss, and provider-error
+  monitoring are not implemented.
 
 Any failed assumption returns the migration to the relevant preflight gate; it
 is not a reason to improvise a production workaround during cutover.

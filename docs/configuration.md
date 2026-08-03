@@ -69,12 +69,18 @@ it a 30-second shutdown grace period.
   FFmpeg, or FFprobe command, using Go duration syntax. Defaults to `30m`.
 - `ACQUISITION_STAGING_PATH`: Root for private per-attempt download
   directories before validation and atomic import. Defaults to
-  `/music/.staging`. At the start of every processing loop, marked private
-  `.harmoniq-attempt-*` directories older than twice the larger of the command
-  timeout and lease duration are removed. Direct files, symbolic links, and
-  unmarked directories in the staging root are not removed by this cleanup.
-  The staging root must differ from `MUSIC_LIBRARY_PATH`, and the final media
-  template must not resolve inside staging.
+  `/music/staging`. New attempts use the non-hidden `harmoniq-attempt-*`
+  prefix because spotDL rewrites dot-prefixed path components in output
+  templates. The importer also accepts the former `.harmoniq-attempt-*`
+  prefix so an owned attempt left by an older worker can be recovered or
+  cleaned up. Both forms require a regular, non-symlink
+  `.harmoniq-owned-attempt` marker plus lexical and resolved containment with
+  no symlink traversal. At the start of every processing loop, only marked
+  attempt directories older than twice the larger of the command timeout and
+  lease duration are removed. Direct files, symbolic links, unmarked
+  directories, and similarly named paths outside the staging root are not
+  removed. The staging root must differ from `MUSIC_LIBRARY_PATH`, and the
+  final media template must not resolve inside staging.
 - `YTDLP_SEARCH_LIMIT`: Maximum yt-dlp candidates resolved for scoring.
   Defaults to `10`; accepted values are `1` through `50`.
 - `YTDLP_MINIMUM_SCORE`: Minimum normalized candidate confidence accepted by
@@ -82,9 +88,11 @@ it a 30-second shutdown grace period.
   An explicit `0` is honored and disables only this aggregate-score threshold;
   hard title, artist, duration, and variant rejection rules still apply.
 - `SPOTDL_BINARY`: spotDL executable path. Defaults to
-  `/usr/local/bin/spotdl`.
+  `/usr/local/bin/spotdl`. The path is inside the worker container; the worker
+  invokes that CLI as a child process rather than calling a host-installed
+  spotDL command.
 - `YTDLP_BINARY`: yt-dlp executable path. Defaults to
-  `/usr/local/bin/yt-dlp`.
+  `/usr/local/bin/yt-dlp`. Like spotDL, it runs inside the worker container.
 - `SPOTDL_USE_CONFIG`: Whether the compatibility provider passes spotDL's
   boolean `--config` flag. Defaults to `true`. spotDL discovers its config from
   its standard locations; this setting is not a file path.
@@ -124,6 +132,17 @@ not negative.
 `config.json`. It defaults to `./.spotdl`. Compose mounts it at the current
 `/home/appuser/.config/spotdl` location and temporarily at the legacy
 `/home/appuser/.spotdl` location so existing adapters continue to work.
+`SPOTDL_USE_CONFIG=true` only passes spotDL's boolean `--config` flag; spotDL
+still discovers `config.json` through those standard locations.
+
+The repository Compose mounts the configuration trees read-only. A deployment
+whose spotDL/yt-dlp configuration uses an on-disk temp area or cookie jar must
+provide narrowly scoped writable mounts for that runtime state. The production
+VM uses writable temp overlays and a private writable runtime copy of its
+cookie file at both standard locations while keeping the canonical config and
+canonical cookie source read-only. Do not solve downloader write requirements
+by making the whole configuration directory writable, and do not put secret
+values in Compose or logs.
 
 ### Logging
 
@@ -146,6 +165,11 @@ the Loki URL.
 ## Volume and Path Notes
 
 - Ensure `MUSIC_LIBRARY_PATH` points to an existing host directory.
+- The image defaults to UID/GID 10001. The current production VM overrides the
+  worker to UID/GID 1000 to match its CIFS mapping; the worker and its spotDL,
+  yt-dlp, FFmpeg, and FFprobe child processes all use that effective identity.
+  Make every writable bind mount accessible to the identity selected by the
+  deployment.
 - Keep `PLAYLISTS_OUTPUT_PATH` inside the mounted library for portability.
 - Keep media and playlist output settings inside the same mounted library when
   both must be visible to other services.

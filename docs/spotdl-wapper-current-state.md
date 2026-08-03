@@ -1,8 +1,13 @@
 # `spotdl-wapper`: current state
 
 This document describes the integrated implementation in the repository as of
-2026-07-28. It is an as-built reference, not a description of the pre-migration
+2026-08-03. It is an as-built reference, not a description of the pre-migration
 wrapper.
+
+The accepted spotDL-primary production image was built from source revision
+`66249d8352029c4c1f4bb8207b61950aa326d714`. Its VM-specific identity,
+mounts, runtime overlays, image ID, and canary evidence are recorded in
+[`vm-infrastructure-production-state.md`](./vm-infrastructure-production-state.md).
 
 The repository and Compose service retain the historical name
 `spotdl-wapper`. Some log labels use `spotdl-wrapper`.
@@ -61,6 +66,11 @@ There is no HTTP endpoint on the worker. Producers write MongoDB documents,
 and the process polls for eligible work. `album-queue` now treats the worker as
 the lifecycle owner: rendering the queue may calculate a local progress
 snapshot, but it does not mark a request complete.
+
+In the deployed architecture, `spotdl-wapper`, spotDL, yt-dlp, FFmpeg, and
+FFprobe all run in the same worker container. The Go process invokes each CLI
+as a child process; it does not call a spotDL installation or cron job on the
+VM host.
 
 `dynamic-playlists` still has a separate subscribed/dynamic playlist workflow
 and its own M3U generation. One-off `playlist-requests` remain in this worker.
@@ -201,9 +211,18 @@ direct yt-dlp score or identify spotDL's actual media source.
 Each acquisition uses a private attempt directory beneath staging:
 
 ```text
-<ACQUISITION_STAGING_PATH>/.harmoniq-attempt-<spotify-or-derived-id>-<random>/
+<ACQUISITION_STAGING_PATH>/harmoniq-attempt-<spotify-or-derived-id>-<random>/
+  .harmoniq-owned-attempt
   <spotify-or-derived-id>.<format>
 ```
+
+The current attempt prefix is deliberately not dot-prefixed. spotDL sanitizes
+dot-prefixed path components in its output template; with the former
+`.harmoniq-attempt-*` prefix it could remove the leading dot, write into a
+different sibling directory, and leave the wrapper checking a path that was
+never populated. The importer continues to recognize legacy
+`.harmoniq-attempt-*` directories during migration, but it trusts either
+prefix only when the ownership marker and all path-safety checks pass.
 
 The command receives an output template ending in `{output-ext}` and the
 adapter verifies the expected configured-format result:
@@ -218,8 +237,8 @@ spotdl <spotify-track-url> \
 
 `SPOTDL_USE_CONFIG=true` adds spotDL's boolean `--config` flag. spotDL discovers
 the file in its standard config locations; no config pathname is passed to the
-CLI. There is no bulk request branch and no `--sync-without-deleting`
-behavior.
+CLI. The CLI itself is installed and invoked inside the worker container.
+There is no bulk request branch and no `--sync-without-deleting` behavior.
 
 ### Direct yt-dlp provider
 
@@ -271,8 +290,11 @@ for converting a provider result into a catalog item:
 
 1. Require the provider path to be a non-empty regular, non-symlink file in a
    marked private attempt directory directly beneath
-   `ACQUISITION_STAGING_PATH`; validate resolved containment and verify the
-   provider-supplied checksum when present.
+   `ACQUISITION_STAGING_PATH`; accept the current `harmoniq-attempt-*` prefix
+   or the legacy `.harmoniq-attempt-*` prefix, require a regular non-symlink
+   `.harmoniq-owned-attempt` marker, validate lexical and resolved containment
+   with no symlink traversal, and verify the provider-supplied checksum when
+   present.
 2. Expand `MEDIA_OUTPUT_TEMPLATE` and reject a final path outside
    `MUSIC_LIBRARY_PATH`. Staging and library roots must differ, and the media
    template cannot point into staging.
@@ -312,18 +334,18 @@ publication but before the journal write can still leave an uncataloged file
 until reacquisition or external reconciliation.
 
 After acquisition, a failure before the importer successfully consumes the
-asset invokes its discard path. Discard repeats marked ownership, resolved
+asset invokes its discard path. Discard repeats prefix, marker, resolved
 containment, and no-symlink validation before removing the staged file and its
 now-empty attempt directory. Once import succeeds, the source has already been
 consumed. The worker journals the published artifact next; subsequent catalog
 failures resume from it, while failure before that journal is durable leaves
 the small reconciliation boundary described above. Before every processing
-pass, staging cleanup removes marked `.harmoniq-attempt-*` directories older
-than twice the larger of
+pass, staging cleanup removes marked current `harmoniq-attempt-*` and legacy
+`.harmoniq-attempt-*` directories older than twice the larger of
 `ACQUISITION_COMMAND_TIMEOUT` and `WORKER_LEASE_DURATION`. It intentionally
-does not delete direct files or symlinks in staging. This cleanup addresses
-abandoned provider attempts, not the publish-before-journal window in the final
-library.
+does not delete direct files, symlinks, unmarked directories, or similarly
+named directories outside the staging root. This cleanup addresses abandoned
+provider attempts, not the publish-before-journal window in the final library.
 
 ## Durable request states
 
@@ -512,16 +534,30 @@ are:
 
 - `MEDIA_OUTPUT_TEMPLATE` controls final media paths;
 - `PLAYLISTS_OUTPUT_PATH` controls M3U placement;
-- `ACQUISITION_STAGING_PATH` contains provider output;
+- `ACQUISITION_STAGING_PATH` contains provider output and defaults to
+  `/music/staging` (the production VM overrides it with its host-local staging
+  bind path);
 - `DESTINATION` is only a deprecated media-template alias;
 - `WORKER_POLL_INTERVAL` controls ticker cadence;
 - `SLEEP_IN_MINUTES` only throttles requests within a drain.
 
-The container runs as non-root UID 10001. The mounted music library must allow
-that user to create staging, media, and playlist files. Compose defaults the
-spotDL configuration host path to `./.spotdl`, mounts it at both spotDL's
-current and temporary legacy locations, and leaves Loki delivery disabled by
-default.
+The image defaults to non-root UID 10001. The production VM explicitly runs
+the worker as UID/GID 1000 to match the NAS CIFS identity mapping; the Go
+worker and all child CLIs therefore use 1000 there. This is a Compose runtime
+override, not a different image. Staging, media, playlist, downloader cache,
+and other writable mounts must be owned or ACLed for the effective runtime
+identity.
+
+Compose defaults the spotDL configuration host path to `./.spotdl` and mounts
+it read-only at both spotDL's current `/home/appuser/.config/spotdl` location
+and its temporary legacy `/home/appuser/.spotdl` location. That standard-path
+configuration is separate from downloader runtime state. spotDL and yt-dlp
+may need to create temporary data and persist an updated cookie jar, so the
+production VM overlays narrowly scoped writable temp locations and a private
+writable runtime copy of the cookie file. The canonical configuration and
+canonical cookie source remain read-only; making the entire configuration
+tree writable is neither required nor intended. Loki delivery remains
+disabled by default.
 
 The Dockerfile currently pins:
 
@@ -596,12 +632,14 @@ Loki delivery starts at info-level.
 
 The wrapper now has unit/contract coverage for:
 
-- provider selection, spotDL/yt-dlp commands, machine-output parsing,
-  cancellation on Linux and Darwin, diagnostics, and candidate scoring;
+- provider selection, spotDL/yt-dlp commands, spotDL-safe non-hidden attempt
+  paths and rejection of dot-prefixed staging components, machine-output
+  parsing, cancellation on Linux and Darwin, diagnostics, and candidate
+  scoring;
 - importer path safety, provider-checksum verification, duration validation,
   canonical metadata, deterministic muxing, bounded components, final
   checksums, collision/idempotency behavior, publication, discard, and
-  ownership-marked orphan-attempt cleanup;
+  current/legacy ownership-marked orphan-attempt cleanup;
 - atomic claims, random claim fencing, backend affinity, lease ownership,
   legacy eligibility, state dual-writing, duplicate suppression, and catalog
   identity;

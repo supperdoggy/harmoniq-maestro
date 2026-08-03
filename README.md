@@ -46,11 +46,14 @@ known limitations are documented in
 [docs/spotdl-wapper-current-state.md](./docs/spotdl-wapper-current-state.md).
 The migration decision record and rollout/rollback guidance are in
 [docs/spotdl-wapper-migration.md](./docs/spotdl-wapper-migration.md).
-For the observed `music-services` VM, use the deployment-specific
-[current-state snapshot](./docs/vm-infrastructure-current-state.md) and
-[migration runbook](./docs/vm-infrastructure-spotdl-migration.md); the root
-Compose file is not the live VM topology and must not be applied there
-unchanged.
+For the `music-services` VM, use the immutable
+[pre-migration snapshot](./docs/vm-infrastructure-current-state.md), the
+[migration runbook](./docs/vm-infrastructure-spotdl-migration.md), and the
+[post-cutover production state](./docs/vm-infrastructure-production-state.md).
+Production uses a worker-only Compose project: the Go coordinator invokes the
+spotDL CLI inside its container while the existing Telegram queue bot and
+remote MongoDB remain separate. The root Compose file is not the live VM
+topology and must not be applied there unchanged.
 
 ## Experimental Services
 

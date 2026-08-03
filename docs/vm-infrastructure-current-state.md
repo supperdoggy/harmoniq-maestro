@@ -5,6 +5,11 @@ This document records the observed state of the `music-services` VM on
 The change-authorized migration plan derived from this snapshot is
 [`vm-infrastructure-spotdl-migration.md`](./vm-infrastructure-spotdl-migration.md).
 
+This snapshot is intentionally preserved as the pre-migration baseline. The
+current post-cutover production topology and deployment evidence are recorded
+separately in
+[`vm-infrastructure-production-state.md`](./vm-infrastructure-production-state.md).
+
 | Item | Value |
 |---|---|
 | Observation window | 2026-08-01 21:30:22 to approximately 21:39 CEST |

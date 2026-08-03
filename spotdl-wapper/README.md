@@ -83,9 +83,15 @@ Important controls are:
 `MEDIA_OUTPUT_TEMPLATE`.
 
 Supported audio formats are `mp3`, `flac`, `ogg`, `opus`, `m4a`, and `wav`.
-Private staging attempts use reserved, ownership-marked directories and are
-discarded after failures before successful import; only old marked attempt
-directories left by crashes are removed on a later processing loop.
+Private staging attempts use non-hidden `harmoniq-attempt-*` directories. This
+avoids spotDL rewriting a dot-prefixed directory component and writing beside
+the path the wrapper is monitoring. The importer also recognizes legacy
+`.harmoniq-attempt-*` directories during migration. Either prefix is trusted
+only for a directory directly beneath staging with a regular non-symlink
+`.harmoniq-owned-attempt` marker, resolved containment, and no symlink path
+components. Failed attempts are discarded; only old, marked, contained
+attempts left by crashes are swept on a later processing loop. The default
+staging root is `/music/staging`.
 
 ## Build
 
@@ -94,6 +100,13 @@ go build -o spotdl-wapper .
 ```
 
 ## Run
+
+The deployed worker runs under Compose. spotDL, yt-dlp, FFmpeg, and FFprobe are
+installed in the worker image and invoked as child processes inside that
+container; no host spotDL cron job or out-of-container CLI is part of the
+active path.
+
+For local development, the binary can also be run directly:
 
 ```bash
 DATABASE_URL="mongodb://localhost:27017" \
@@ -111,11 +124,22 @@ SPOTIFY_CLIENT_SECRET="..." \
 
 The container currently pins Go 1.23.4, Python 3.13.14, Deno 2.9.4, spotDL
 4.5.2, yt-dlp 2026.7.4, and yt-dlp-ejs 0.8.0. FFmpeg and CA/timezone packages
-come from the Debian image repositories. The final process runs as UID 10001,
-so the mounted staging, media, and playlist paths must be writable by that
-user.
+come from the Debian image repositories. The image defaults to UID/GID 10001.
+The production VM overrides the worker to UID/GID 1000 to match its NAS CIFS
+mapping, so every process inside that container uses 1000 there. Mounted
+staging, media, playlist, downloader temp, and runtime-cookie paths must be
+writable by the deployment's effective identity.
+
+With `SPOTDL_USE_CONFIG=true`, spotDL finds `config.json` in its standard
+container locations; the wrapper does not pass a config pathname. The
+configuration itself can remain read-only, but spotDL/yt-dlp may require
+writable temp storage and may update a cookie jar. Production therefore uses
+narrowly scoped writable temp mounts and a private writable runtime cookie
+copy while retaining protected read-only canonical inputs.
 
 For the full as-built architecture and operational caveats, see
 [the current-state document](../docs/spotdl-wapper-current-state.md). For the
 decision history, rollout, rollback, and remaining replacement work, see
-[the migration document](../docs/spotdl-wapper-migration.md).
+[the migration document](../docs/spotdl-wapper-migration.md). The exact
+`music-services` artifact, mounts, service state, and successful canary are in
+[the production-state record](../docs/vm-infrastructure-production-state.md).

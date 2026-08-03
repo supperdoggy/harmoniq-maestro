@@ -11,6 +11,13 @@ For the observed `music-services` VM, including its remote MongoDB, CIFS path
 contract, legacy cron jobs, worker-only Compose manifest, cutover checks, and
 rollback procedure, use
 [`vm-infrastructure-spotdl-migration.md`](./vm-infrastructure-spotdl-migration.md).
+The resulting production deployment and its verification evidence are in
+[`vm-infrastructure-production-state.md`](./vm-infrastructure-production-state.md).
+
+Deployment status as of 2026-08-03: Stage A is deployed with
+`ACQUISITION_BACKEND=spotdl`. This completed the coordinator/infrastructure
+migration, not the provider replacement. Stage B and every direct `yt-dlp`
+rollout stage remain future work.
 
 ## Decision
 
@@ -94,7 +101,7 @@ current migration ledger.
 | Explicit durable download states | Implemented | Dual-written with legacy `active`/`errored` flags |
 | Typed failures and scheduled retries | Implemented | Acquisition-pipeline failures share one request-wide budget; published-artifact catalog finalization backs off without consuming it |
 | Synchronous validation and catalog import | Implemented | Provider checksum verification, deterministic FFmpeg tags/artwork, FFprobe duration check, bounded paths, `0640` output, synced hard-link publication, recovery journal/resume, collision handling, and upsert |
-| Private staging attempts and cleanup | Implemented | Providers use marked isolated directories; discard and the old-attempt sweeper enforce resolved no-symlink ownership |
+| Private staging attempts and cleanup | Implemented | New attempts use non-hidden `harmoniq-attempt-*` directories because spotDL rewrites dot-prefixed path components; the marker, direct-child containment, and no-symlink checks remain authoritative, and legacy marked `.harmoniq-attempt-*` directories remain supported during migration |
 | Removal of indexer completion gate | Implemented | Active worker paths do not use `index-status` |
 | Atomic/safe one-off M3Us | Implemented | Regular-file and resolved containment checks, replace semantics, and directory sync |
 | Backend affinity per request | Implemented | First claim pins an empty backend; retries and reclaims stay on it |
@@ -148,10 +155,17 @@ Its limitations are deliberate:
 - backend assignment happens by first claim rather than a producer-controlled
   routing policy.
 
-Each attempt uses a private staging directory and the shared importer verifies
-the staged checksum, tags and probes the file, publishes it, and updates the
-catalog. The compatibility provider therefore retains spotDL matching without
-giving spotDL ownership of final paths or queue state.
+Each attempt uses a private `harmoniq-attempt-*` staging directory containing
+the `.harmoniq-owned-attempt` marker. The non-hidden prefix is required because
+spotDL 4.5.2 sanitizes dot-prefixed path components in its output template.
+The importer verifies the marker, direct-child and resolved containment,
+no-symlink boundary, staged checksum, tags, and media before publishing and
+updating the catalog. Legacy marked `.harmoniq-attempt-*` directories remain
+valid for import, discard, and age-based cleanup during the transition;
+unmarked directories are never adopted or removed automatically.
+
+The compatibility provider therefore retains spotDL matching without giving
+spotDL ownership of final paths or queue state.
 
 See the
 [spotDL release history](https://github.com/spotDL/spotify-downloader/releases)
@@ -322,16 +336,35 @@ also receives fair scheduling when downloads are continuously available.
 
 ## Rollout plan
 
-### Stage A: deploy the new coordinator with spotDL
+### Stage A: deploy the new coordinator with spotDL — deployed
 
 Keep `ACQUISITION_BACKEND=spotdl`. This changes orchestration and import while
 retaining the familiar acquisition engine.
 
+Stage A was deployed to `music-services` on 2026-08-03 from source revision
+`66249d8352029c4c1f4bb8207b61950aa326d714`. The production image is
+`harmoniq-spotdl-wapper:66249d835202-amd64` with image ID
+`sha256:0c50782a027f8ff2dc6935a7652340422c0b66f35d2e4a80e7683b4bc4250bea`.
+spotDL remains the primary backend and is invoked by the coordinator inside
+that container. See the production-state document for the complete as-built
+manifest, evidence, and residual risks.
+
+The first track canary exposed four deployment-contract issues before the
+final image was accepted: spotDL needed writable private temp state; yt-dlp
+needed a writable runtime cookie copy while the canonical cookie remained
+read-only; the copied configuration required Deno and the `web_music` player
+client; and spotDL rewrote the old dot-prefixed attempt path. Revision
+`66249d8` uses a non-hidden current attempt prefix, retains safe support for
+legacy marked attempts, and rejects dot-prefixed spotDL staging components.
+
 Before deployment:
 
 - back up MongoDB and the library metadata needed for recovery;
-- verify staging, media, and playlist paths are writable by UID 10001;
-- verify the spotDL config mount in both configured locations;
+- verify staging, media, and playlist paths are writable by the configured
+  runtime identity (UID/GID `1000` in production; `10001` remains the image
+  default);
+- verify the read-only spotDL config mount and the separate private writable
+  temp/cookie overlays in both configured locations;
 - inspect duplicate Spotify IDs that could prevent the unique sparse identity
   index; duplicate checksums are valid and the checksum index is non-unique;
 - configure a Spotify refresh token when Development Mode playlist access is
@@ -343,6 +376,15 @@ catalog identities, recovery from a failed catalog upsert without
 reacquisition, multi-track resume, and playlist replacement. Do not enable
 direct yt-dlp merely because the process is stable; matching needs separate
 validation.
+
+The accepted track canary
+`b172653c-ea77-48d6-8d77-c04a356f112a` completed with `backend=spotdl`, one
+preserved retry, exactly one catalog row for Spotify ID
+`03jnWnj2qOrYofsyCTuHC6`, and an empty staging directory. The imported M4A was
+11,235,648 bytes, mode `0640`, UID/GID `1000:1000`, and its FFprobe duration
+was 198.996 seconds. This is a bounded production canary, not a substitute for
+the automated real-MongoDB/tool end-to-end test or the album, playlist, and
+soak gates above.
 
 ### Stage B: build a non-mutating comparison path
 
@@ -501,7 +543,9 @@ Before making a replacement provider primary, test:
   and read-only mounts;
 - deterministic tags, artwork policy, `0640` modes, paths, checksums, collision
   behavior, component-length bounds, OGG/Opus retry determinism, sync
-  boundaries, discard, orphan-attempt cleanup, and idempotent reprocessing;
+  boundaries, exact spotDL output-path preservation, current and legacy marked
+  attempt handling, refusal to adopt unmarked sanitized siblings, discard,
+  orphan-attempt cleanup, and idempotent reprocessing;
 - complete, `no_pull` partial, empty, missing-file wait, and replacement M3Us;
 - container startup checks and a real MongoDB/tool end-to-end path.
 
