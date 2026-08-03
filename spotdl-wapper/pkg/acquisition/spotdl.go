@@ -54,6 +54,13 @@ func NewSpotDLProvider(config SpotDLConfig, runner CommandRunner) (*SpotDLProvid
 	if err != nil {
 		return nil, fmt.Errorf("make spotdl output directory absolute: %w", err)
 	}
+	if component := dotPrefixedPathComponent(absoluteOutputDirectory); component != "" {
+		return nil, fmt.Errorf(
+			"spotdl output directory %q contains dot-prefixed component %q, which spotDL rewrites",
+			absoluteOutputDirectory,
+			component,
+		)
+	}
 
 	binary := strings.TrimSpace(config.Binary)
 	if binary == "" {
@@ -74,6 +81,15 @@ func NewSpotDLProvider(config SpotDLConfig, runner CommandRunner) (*SpotDLProvid
 		commandTimeout:  normalizeTimeout(config.CommandTimeout),
 		runner:          normalizeRunner(runner),
 	}, nil
+}
+
+func dotPrefixedPathComponent(path string) string {
+	for _, component := range strings.Split(filepath.Clean(path), string(filepath.Separator)) {
+		if strings.HasPrefix(component, ".") && component != "." && component != ".." {
+			return component
+		}
+	}
+	return ""
 }
 
 func (p *SpotDLProvider) Name() ProviderName {

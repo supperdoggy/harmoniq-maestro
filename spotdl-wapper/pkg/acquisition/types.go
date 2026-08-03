@@ -21,10 +21,17 @@ const (
 	ProviderYTDLP  ProviderName = "yt-dlp"
 
 	// AttemptDirectoryPrefix and AttemptMarkerFilename identify private
-	// provider staging directories owned by this worker. Import cleanup uses
-	// both values so it never sweeps arbitrary user directories.
-	AttemptDirectoryPrefix = ".harmoniq-attempt-"
+	// provider staging directories owned by this worker. The current prefix is
+	// deliberately not dot-prefixed: spotDL sanitizes dot-prefixed directory
+	// components in output templates and would otherwise write beside the
+	// directory the worker created. Import cleanup uses the prefix and marker
+	// together so it never sweeps arbitrary user directories.
+	AttemptDirectoryPrefix = "harmoniq-attempt-"
 	AttemptMarkerFilename  = ".harmoniq-owned-attempt"
+
+	// LegacyAttemptDirectoryPrefix is accepted only so attempts left by a
+	// pre-migration worker can still be imported, discarded, or swept safely.
+	LegacyAttemptDirectoryPrefix = ".harmoniq-attempt-"
 )
 
 // Variant describes a materially different recording or edit.
@@ -95,6 +102,14 @@ type Provider interface {
 	Name() ProviderName
 	Resolve(ctx context.Context, track TrackSpec) ([]Candidate, error)
 	Acquire(ctx context.Context, track TrackSpec, candidate Candidate) (AssetResult, error)
+}
+
+// HasAttemptDirectoryPrefix reports whether name uses a current or legacy
+// Harmoniq attempt prefix. A matching ownership marker is still required
+// before an attempt is trusted or removed.
+func HasAttemptDirectoryPrefix(name string) bool {
+	return strings.HasPrefix(name, AttemptDirectoryPrefix) ||
+		strings.HasPrefix(name, LegacyAttemptDirectoryPrefix)
 }
 
 var (

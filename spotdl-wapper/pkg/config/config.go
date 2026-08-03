@@ -36,7 +36,7 @@ type Config struct {
 	AcquisitionBackend        string        `envconfig:"ACQUISITION_BACKEND" default:"spotdl"`
 	AcquisitionAudioFormat    string        `envconfig:"ACQUISITION_AUDIO_FORMAT" default:"mp3"`
 	AcquisitionCommandTimeout time.Duration `envconfig:"ACQUISITION_COMMAND_TIMEOUT" default:"30m"`
-	AcquisitionStagingPath    string        `envconfig:"ACQUISITION_STAGING_PATH" default:"/music/.staging"`
+	AcquisitionStagingPath    string        `envconfig:"ACQUISITION_STAGING_PATH" default:"/music/staging"`
 	YTDLPSearchLimit          int           `envconfig:"YTDLP_SEARCH_LIMIT" default:"10"`
 	YTDLPMinimumScore         float64       `envconfig:"YTDLP_MINIMUM_SCORE" default:"0.72"`
 	WorkerPollInterval        time.Duration `envconfig:"WORKER_POLL_INTERVAL" default:"1m"`

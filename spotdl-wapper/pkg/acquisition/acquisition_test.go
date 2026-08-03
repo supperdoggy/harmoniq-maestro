@@ -137,6 +137,9 @@ func TestSpotDLProviderResolveAndAcquire(t *testing.T) {
 	) {
 		t.Fatalf("attempt directory = %q, want sanitized track prefix", attemptDirectory)
 	}
+	if strings.HasPrefix(filepath.Base(attemptDirectory), ".") {
+		t.Fatalf("attempt directory = %q, spotDL rewrites dot-prefixed output paths", attemptDirectory)
+	}
 	if _, err := os.Stat(filepath.Join(attemptDirectory, AttemptMarkerFilename)); err != nil {
 		t.Fatalf("attempt marker missing: %v", err)
 	}
@@ -172,6 +175,32 @@ func TestSpotDLProviderResolveAndAcquire(t *testing.T) {
 	}
 	if !reflect.DeepEqual(result, expectedResult) {
 		t.Errorf("Acquire() result = %#v, want %#v", result, expectedResult)
+	}
+}
+
+func TestHasAttemptDirectoryPrefixSupportsMigration(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{name: AttemptDirectoryPrefix + "current", want: true},
+		{name: LegacyAttemptDirectoryPrefix + "legacy", want: true},
+		{name: "user-media", want: false},
+		{name: "prefix-" + AttemptDirectoryPrefix + "nested", want: false},
+	}
+
+	for _, test := range tests {
+		if got := HasAttemptDirectoryPrefix(test.name); got != test.want {
+			t.Errorf("HasAttemptDirectoryPrefix(%q) = %t, want %t", test.name, got, test.want)
+		}
+	}
+}
+
+func TestSpotDLProviderRejectsDotPrefixedOutputComponent(t *testing.T) {
+	outputDirectory := filepath.Join(t.TempDir(), ".staging")
+	_, err := NewSpotDLProvider(SpotDLConfig{OutputDirectory: outputDirectory}, &fakeRunner{})
+	if err == nil || !strings.Contains(err.Error(), "dot-prefixed component") {
+		t.Fatalf("NewSpotDLProvider() error = %v, want dot-prefixed component rejection", err)
 	}
 }
 

@@ -476,7 +476,8 @@ func TestDiscardAndCleanupOrphansStayWithinStaging(t *testing.T) {
 
 	oldAttempt := filepath.Join(stagingRoot, acquisition.AttemptDirectoryPrefix+"old")
 	newAttempt := filepath.Join(stagingRoot, acquisition.AttemptDirectoryPrefix+"new")
-	for _, directory := range []string{oldAttempt, newAttempt} {
+	legacyAttempt := filepath.Join(stagingRoot, acquisition.LegacyAttemptDirectoryPrefix+"legacy")
+	for _, directory := range []string{oldAttempt, newAttempt, legacyAttempt} {
 		if err := os.Mkdir(directory, 0o750); err != nil {
 			t.Fatal(err)
 		}
@@ -495,11 +496,21 @@ func TestDiscardAndCleanupOrphansStayWithinStaging(t *testing.T) {
 	if err := os.Mkdir(unownedOldDirectory, 0o750); err != nil {
 		t.Fatal(err)
 	}
+	unmarkedAttempt := filepath.Join(stagingRoot, acquisition.AttemptDirectoryPrefix+"unmarked")
+	if err := os.Mkdir(unmarkedAttempt, 0o750); err != nil {
+		t.Fatal(err)
+	}
 	oldTime := time.Now().Add(-4 * time.Hour)
 	if err := os.Chtimes(oldAttempt, oldTime, oldTime); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chtimes(legacyAttempt, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chtimes(unownedOldDirectory, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(unmarkedAttempt, oldTime, oldTime); err != nil {
 		t.Fatal(err)
 	}
 
@@ -507,8 +518,8 @@ func TestDiscardAndCleanupOrphansStayWithinStaging(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CleanupOrphans() error = %v", err)
 	}
-	if removed != 1 {
-		t.Fatalf("CleanupOrphans() removed = %d, want 1", removed)
+	if removed != 2 {
+		t.Fatalf("CleanupOrphans() removed = %d, want 2", removed)
 	}
 	if _, err := os.Stat(oldAttempt); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("old attempt still exists or unexpected error: %v", err)
@@ -516,8 +527,14 @@ func TestDiscardAndCleanupOrphansStayWithinStaging(t *testing.T) {
 	if _, err := os.Stat(newAttempt); err != nil {
 		t.Fatalf("new attempt was removed: %v", err)
 	}
+	if _, err := os.Stat(legacyAttempt); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy attempt still exists or unexpected error: %v", err)
+	}
 	if _, err := os.Stat(unownedOldDirectory); err != nil {
 		t.Fatalf("unowned directory was removed: %v", err)
+	}
+	if _, err := os.Stat(unmarkedAttempt); err != nil {
+		t.Fatalf("unmarked attempt was removed: %v", err)
 	}
 }
 

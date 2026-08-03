@@ -159,7 +159,7 @@ func (i *Importer) CleanupOrphans(cutoff time.Time) (int, error) {
 	for _, entry := range entries {
 		if entry.Type()&os.ModeSymlink != 0 ||
 			!entry.IsDir() ||
-			!strings.HasPrefix(entry.Name(), acquisition.AttemptDirectoryPrefix) {
+			!acquisition.HasAttemptDirectoryPrefix(entry.Name()) {
 			continue
 		}
 		info, err := entry.Info()
@@ -718,7 +718,7 @@ func truncateUTF8Bytes(value string, maximumBytes int) string {
 func (i *Importer) validateOwnedStagedAsset(sourcePath string) (string, error) {
 	attemptDirectory := filepath.Dir(sourcePath)
 	if filepath.Dir(attemptDirectory) != i.stagingRoot ||
-		!strings.HasPrefix(filepath.Base(attemptDirectory), acquisition.AttemptDirectoryPrefix) {
+		!acquisition.HasAttemptDirectoryPrefix(filepath.Base(attemptDirectory)) {
 		return "", fmt.Errorf(
 			"%w: asset is not inside a private Harmoniq attempt directory",
 			ErrInvalidAsset,

@@ -56,8 +56,8 @@ func TestNewConfigDefaults(t *testing.T) {
 	if cfg.AcquisitionCommandTimeout != 30*time.Minute {
 		t.Errorf("AcquisitionCommandTimeout = %v, want %v", cfg.AcquisitionCommandTimeout, 30*time.Minute)
 	}
-	if cfg.AcquisitionStagingPath != "/music/.staging" {
-		t.Errorf("AcquisitionStagingPath = %q, want /music/.staging", cfg.AcquisitionStagingPath)
+	if cfg.AcquisitionStagingPath != "/music/staging" {
+		t.Errorf("AcquisitionStagingPath = %q, want /music/staging", cfg.AcquisitionStagingPath)
 	}
 	if cfg.YTDLPSearchLimit != 10 {
 		t.Errorf("YTDLPSearchLimit = %d, want 10", cfg.YTDLPSearchLimit)
