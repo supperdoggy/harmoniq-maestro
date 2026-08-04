@@ -1,5 +1,12 @@
-# Use the official Golang image as a build stage
-FROM golang:1.23-alpine AS builder
+# syntax=docker/dockerfile:1
+
+# Use the build host for compilation while targeting the requested runtime
+# platform. This prevents an arm64 Alpine base from being combined with the
+# explicitly cross-compiled amd64 Go binary.
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS builder
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 
 # Install git and other dependencies
 RUN apk add --no-cache git ca-certificates
@@ -19,7 +26,7 @@ RUN go mod download
 COPY album-queue/ .
 
 # Build the Go app
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o main .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-w -s" -o main .
 
 # Use a minimal base image for the final stage
 FROM alpine:3.20

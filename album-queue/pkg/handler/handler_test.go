@@ -2,8 +2,11 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/album-queue/pkg/db"
 	models "github.com/supperdoggy/spot-models"
@@ -146,6 +149,7 @@ func createTestHandler(database *fakeDatabase, sinks *testSinks) *handler {
 			sinks.replies = append(sinks.replies, text)
 			return nil
 		},
+		sleepFn: func(time.Duration) {},
 		sendWebhookFn: func() error {
 			sinks.webhookCalls++
 			return nil
@@ -208,6 +212,105 @@ func TestHandleQueue_RendersProgressWithoutMutatingWorkerJob(t *testing.T) {
 	}
 	if len(sinks.replies) != 1 || !strings.Contains(sinks.replies[0], "1/1 (100%)") {
 		t.Fatalf("queue did not render refreshed local progress: %#v", sinks.replies)
+	}
+}
+
+func TestHandleQueueSplitsLongTelegramResponse(t *testing.T) {
+	requests := make([]models.DownloadQueueRequest, 70)
+	for i := range requests {
+		requests[i] = models.DownloadQueueRequest{
+			ID:     "request",
+			Name:   strings.Repeat("Довга назва альбому 🚀 ", 20),
+			Active: true,
+		}
+	}
+	database := &fakeDatabase{
+		activeByURL:    map[string]bool{},
+		activeRequests: requests,
+	}
+	sinks := &testSinks{}
+	h := createTestHandler(database, sinks)
+
+	h.HandleQueue(testMessage("/queue"))
+
+	if len(sinks.replies) <= 1 {
+		t.Fatalf("queue replies = %d, want a chunked response", len(sinks.replies))
+	}
+	for index, reply := range sinks.replies {
+		if len(reply) > telegramMessageMaxBytes {
+			t.Errorf("reply %d has %d bytes, limit is %d", index, len(reply), telegramMessageMaxBytes)
+		}
+		if !utf8.ValidString(reply) {
+			t.Errorf("reply %d splits a UTF-8 rune", index)
+		}
+	}
+	if got := strings.Count(strings.Join(sinks.replies, ""), "📀 "); got != len(requests) {
+		t.Errorf("rendered request count = %d, want %d", got, len(requests))
+	}
+}
+
+func TestSplitTelegramTextPreservesContent(t *testing.T) {
+	message := strings.Repeat("довгий рядок 🚀\n", 1000)
+	parts := splitTelegramText(message)
+	if len(parts) <= 1 {
+		t.Fatalf("splitTelegramText() returned %d part, want multiple", len(parts))
+	}
+	for index, part := range parts {
+		if len(part) > telegramMessageContentMaxBytes {
+			t.Errorf("part %d has %d bytes, limit is %d", index, len(part), telegramMessageContentMaxBytes)
+		}
+		if !utf8.ValidString(part) {
+			t.Errorf("part %d is not valid UTF-8", index)
+		}
+	}
+	if got := strings.Join(parts, ""); got != message {
+		t.Error("splitTelegramText() did not preserve the original message")
+	}
+}
+
+func TestReplyQueueStopsAfterSendFailure(t *testing.T) {
+	h := createTestHandler(&fakeDatabase{}, &testSinks{})
+	calls := 0
+	h.replyFunc = func(*telebot.Message, string) error {
+		calls++
+		if calls == 2 {
+			return errors.New("send failed")
+		}
+		return nil
+	}
+
+	h.replyQueue(testMessage("/queue"), strings.Repeat("queue entry\n", 1500))
+
+	if calls != 2 {
+		t.Fatalf("reply calls = %d, want 2 after second-part failure", calls)
+	}
+}
+
+func TestReplyQueueRetriesFloodErrorOnce(t *testing.T) {
+	h := createTestHandler(&fakeDatabase{}, &testSinks{})
+	calls := 0
+	var sleeps []time.Duration
+	h.sleepFn = func(duration time.Duration) {
+		sleeps = append(sleeps, duration)
+	}
+	h.replyFunc = func(*telebot.Message, string) error {
+		calls++
+		if calls == 1 {
+			return telebot.FloodError{
+				APIError:   telebot.NewAPIError(429, "Too Many Requests"),
+				RetryAfter: 2,
+			}
+		}
+		return nil
+	}
+
+	h.replyQueue(testMessage("/queue"), "queue")
+
+	if calls != 2 {
+		t.Fatalf("reply calls = %d, want one retry", calls)
+	}
+	if len(sleeps) != 1 || sleeps[0] != 2*time.Second {
+		t.Fatalf("sleep durations = %v, want [2s]", sleeps)
 	}
 }
 

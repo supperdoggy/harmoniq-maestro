@@ -1,0 +1,15 @@
+# The build context is the repository root, but this image needs only the
+# queue-bot module and its local models dependency.
+**
+!album-queue/
+!album-queue/**
+!models/
+!models/**
+
+# Never send local credentials, editor state, or previously exported images to
+# the Docker daemon, even though they are already ignored by Git.
+album-queue/.env
+album-queue/.env.*
+album-queue/.DS_Store
+album-queue/.vscode/
+album-queue/*.tar

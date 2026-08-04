@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/album-queue/pkg/db"
 	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/album-queue/pkg/utils"
@@ -35,6 +36,12 @@ type Handler interface {
 const (
 	failedPageCallbackUnique = "failed_page"
 	failedPageSize           = 5
+	// Telegram accepts at most 4096 characters per text message. Limiting by
+	// UTF-8 bytes is deliberately conservative and leaves room for any API-side
+	// representation differences while guaranteeing the character limit.
+	telegramMessageMaxBytes        = 4096
+	telegramMessageContentMaxBytes = 4000
+	telegramMessagePace            = time.Second
 )
 
 var failedPageCallbackEndpoint = &telebot.InlineButton{Unique: failedPageCallbackUnique}
@@ -51,6 +58,7 @@ type handler struct {
 	log               *zap.Logger
 	doneWebhook       string
 	replyFunc         func(m *telebot.Message, text string) error
+	sleepFn           func(time.Duration)
 	sendWebhookFn     func() error
 	sendFailedPageFn  func(m *telebot.Message, text string, markup *telebot.ReplyMarkup) error
 	editFailedPageFn  func(m *telebot.Message, text string, markup *telebot.ReplyMarkup) error
@@ -69,6 +77,7 @@ func NewHandler(db db.Database, spotifyService spotify.SpotifyService, log *zap.
 			_, err := bot.Reply(m, text)
 			return err
 		},
+		sleepFn: time.Sleep,
 		sendWebhookFn: func() error {
 			return utils.SendDoneWebhook(doneWebhook)
 		},
@@ -102,6 +111,83 @@ func (h *handler) reply(m *telebot.Message, text string) {
 	if err := h.replyFunc(m, text); err != nil {
 		h.log.Error("Failed to send reply", zap.Error(err))
 	}
+}
+
+func (h *handler) replyQueue(m *telebot.Message, text string) {
+	parts := splitTelegramText(text)
+	for index, part := range parts {
+		if index > 0 {
+			h.sleepFn(telegramMessagePace)
+		}
+
+		message := part
+		if len(parts) > 1 {
+			message = fmt.Sprintf("Черга — частина %d/%d\n\n%s", index+1, len(parts), part)
+		}
+		if len(message) > telegramMessageMaxBytes {
+			h.log.Error(
+				"Refusing oversized queue reply",
+				zap.Int("part", index+1),
+				zap.Int("parts", len(parts)),
+				zap.Int("reply_bytes", len(message)),
+			)
+			return
+		}
+
+		if err := h.sendReplyPart(m, message); err != nil {
+			h.log.Error(
+				"Failed to send queue reply",
+				zap.Error(err),
+				zap.Int("part", index+1),
+				zap.Int("parts", len(parts)),
+				zap.Int("reply_bytes", len(message)),
+			)
+			return
+		}
+	}
+}
+
+func (h *handler) sendReplyPart(m *telebot.Message, text string) error {
+	err := h.replyFunc(m, text)
+	if err == nil {
+		return nil
+	}
+
+	var floodError telebot.FloodError
+	if !errors.As(err, &floodError) || floodError.RetryAfter <= 0 {
+		return err
+	}
+
+	h.sleepFn(time.Duration(floodError.RetryAfter) * time.Second)
+	return h.replyFunc(m, text)
+}
+
+func splitTelegramText(text string) []string {
+	if len(text) <= telegramMessageContentMaxBytes {
+		return []string{text}
+	}
+
+	parts := make([]string, 0, len(text)/telegramMessageContentMaxBytes+1)
+	for len(text) > telegramMessageContentMaxBytes {
+		splitAt := telegramMessageContentMaxBytes
+		for splitAt > 0 && !utf8.RuneStart(text[splitAt]) {
+			splitAt--
+		}
+
+		// Prefer a nearby complete line so queue entries are easier to read. A
+		// pathological single line still falls back to a rune-safe hard split.
+		if newline := strings.LastIndexByte(text[:splitAt], '\n'); newline >= telegramMessageContentMaxBytes/2 {
+			splitAt = newline + 1
+		}
+
+		parts = append(parts, text[:splitAt])
+		text = text[splitAt:]
+	}
+	if text != "" {
+		parts = append(parts, text)
+	}
+
+	return parts
 }
 
 func (h *handler) sendWebhook() {
@@ -297,7 +383,7 @@ func (h *handler) HandleQueue(m *telebot.Message) {
 		}
 	}
 
-	h.reply(m, response)
+	h.replyQueue(m, response)
 }
 
 func (h *handler) HandleFailed(m *telebot.Message) {
