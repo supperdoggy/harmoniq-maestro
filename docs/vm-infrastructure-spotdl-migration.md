@@ -3,8 +3,9 @@
 This runbook compares the `music-services` VM observed on 2026-08-01 with the
 provider-neutral `spotdl-wapper` implementation in this repository and defines
 a safe migration path. The procedural sections remain the reusable deployment
-and rollback plan. Stage A was performed on 2026-08-03; its authoritative
-post-cutover topology and evidence are recorded in
+and rollback plan. Stage A was performed on 2026-08-03, and the standalone
+Telegram queue bot was repaired on 2026-08-04. Their authoritative post-
+cutover topology and evidence are recorded in
 [`vm-infrastructure-production-state.md`](./vm-infrastructure-production-state.md).
 
 Read these companion documents first:
@@ -67,10 +68,11 @@ must be an exclusive, maintenance-window switch.
 | Health | Cron invocation proves only that the command started | Container state, logs, MongoDB state transitions, and artifact checks; no worker readiness endpoint exists yet |
 
 The new worker can claim legacy active documents without `state` as pending.
-That proves only enqueue-format compatibility; it does not prove that the
-source-unmapped, unhealthy queue bot will avoid later writes that conflict with
-leases or display every new state correctly. Keep general access paused until
-its full MongoDB behavior is verified during the canary.
+At the original Stage A cutover, that proved only enqueue-format compatibility;
+the then source-unmapped queue bot had not been proven to avoid overwriting
+worker-owned fields while rendering `/queue`. The 2026-08-04 source-mapped
+queue-bot release now creates explicit pending requests and leaves lifecycle,
+lease, result, and error fields to the worker.
 
 ### Stage A as deployed
 
@@ -81,13 +83,48 @@ source revision `66249d8352029c4c1f4bb8207b61950aa326d714` and image
 The transferred source archive SHA-256 is
 `33936b1c88c40749b667447d2461af845d6995583b4ba9208c380ff24d883fbb`.
 
-The worker, Telegram queue bot, and n8n are running. The old acquisition
-worker, indexer, and dynamic-playlist cron entries remain present for rollback
-but have zero enabled entries; the indexer and dynamic-playlists processes are
-stopped. The worker-only Compose project does not start MongoDB, a queue bot,
-an indexer, or dynamic playlists and publishes no network port. spotDL is not
-invoked on the host: the Go coordinator starts the pinned spotDL CLI as a child
-process inside the worker container.
+The worker, source-mapped Telegram queue bot, and n8n are running. The old
+acquisition worker, indexer, and dynamic-playlist cron entries remain present
+for rollback but have zero enabled entries; the indexer and dynamic-playlists
+processes are stopped. The worker-only Compose project does not start MongoDB,
+a queue bot, an indexer, or dynamic playlists and publishes no network port.
+spotDL is not invoked on the host: the Go coordinator starts the pinned spotDL
+CLI as a child process inside the worker container.
+
+### Telegram queue-bot repair as deployed
+
+The 2026-08-04 repair uses source revision
+`97e6c4bdc1e00416286dab6cc37987c370be9dda`, source archive SHA-256
+`68f1b663edfb1b1aba1db1f92c057441857c3e2b613ed38d8e012dda975a9603`,
+and image `telegram-queue-bot:97e6c4bdc1e0-amd64` with image ID
+`sha256:2d31845da18b617de1a5c2731b2258e5f4a5a7ee779dfbda12f17e7bfa732839`.
+The standalone runtime contract was preserved: bridge networking, host port
+8080, no mounts, `json-file` logging, and restart policy `unless-stopped`.
+
+The immediate user-visible failure was not a stale MongoDB query. `/queue`
+successfully loaded 70 active requests, rendered them into one message larger
+than Telegram permits, and then logged the rejected send without returning a
+reply. The repaired handler uses UTF-8-safe 4,000-byte content chunks with
+ordered part labels, one-second pacing, and at most one retry for a Telegram
+429 after honoring `RetryAfter`. It stops later parts after any other send
+failure and does not write worker-owned job fields while rendering the queue.
+
+The old image was also a mixed-architecture artifact: an x86-64 Go binary in
+an ARM64 Alpine runtime. The bot could run, but Docker's shell-form healthcheck
+failed with `exec format error`, causing the false `unhealthy` state. The
+replacement is wholly Linux/amd64 and is healthy with restart count zero. Its
+health, readiness, database-backed stats, and startup checks passed with no
+queue-send errors in the inspected logs. Automated tests cover the 70-request
+multipart behavior and the single 429 retry. Successful Telegram sends are
+not logged, so live receipt remains pending a user `/queue` retry and
+confirmation.
+
+Rollback evidence is protected under
+`/var/backups/harmoniq/97e6c4bdc1e0/telegram-queue-bot-upgrade`. The exact old
+container is retained stopped as `telegram-queue-bot-rollback-20260208`; never
+start it while the current bot is polling the same Telegram token. The exact
+rollback archive is `telegram-queue-bot.rollback.tar`, SHA-256
+`7060b13e0fae36cade72152088d6ad3941e53b6c9e5c67a615cc40f00c968289`.
 
 ## Why the repository Compose file is not the VM manifest
 
@@ -1046,12 +1083,11 @@ docker logs --since 15m harmoniq-spotdl-wapper
 There is no readiness endpoint. A running container is necessary but not
 sufficient.
 
-After acceptance, both `harmoniq-spotdl-wapper` and the existing Telegram bot
-were running with restart count zero, and n8n remained running. Docker still
-labels the queue bot unhealthy because its pre-existing HTTP healthcheck is
-broken; the `./main` process is running and its successful insertion of the
-canary proves the enqueue path independently. The legacy indexer and dynamic
-playlists remain stopped and their cron entries remain disabled.
+After the worker acceptance and the 2026-08-04 queue-bot repair, both
+`harmoniq-spotdl-wapper` and `telegram-queue-bot` were running with restart
+count zero, the queue bot reported healthy, and n8n remained running. The
+legacy indexer and dynamic playlists remain stopped and their cron entries
+remain disabled.
 
 For every canary, verify:
 
@@ -1067,9 +1103,9 @@ For every canary, verify:
 - a normal graceful restart preserves completed work and releases any current
   claim correctly;
 - one-off M3U replacement produces valid, host-readable entries;
-- the legacy queue bot does not write progress/lifecycle fields after enqueue,
-  and it and the dynamic-playlist consumer tolerate the additive schema and
-  stored paths;
+- the source-mapped queue bot does not write progress/lifecycle fields while
+  rendering the queue, and it and the dynamic-playlist consumer tolerate the
+  additive schema and stored paths;
 - source selection, filenames, tags, and downstream readability are compared
   with representative legacy artifacts;
 - logs are visible through the chosen route and contain no secrets.
@@ -1297,7 +1333,8 @@ deleted automatically.
 - Add candidate evidence, review/resume, controlled routing, and audited
   reroute before a normal yt-dlp cohort rollout.
 - Reconcile the remaining publish-before-journal orphan boundary.
-- Upgrade the unhealthy, source-unmapped queue bot as a separate deployment.
+- Replace the remaining mutable `n8n:latest` artifact with a source-mapped,
+  pinned deployment. The queue-bot upgrade is complete.
 - Migrate dynamic playlists separately, preserve `/mnt/music` paths, and
   prevent overlap. The repository's loop sleeps 600 seconds *after* each run,
   so it provides a non-overlapping minimum interval of runtime plus ten
@@ -1322,8 +1359,10 @@ subsequently verified that:
 - current catalog rows use the `/mnt/music/...` namespace consistently;
 - M4A and the deployed output template produce a playable, cataloged mode-0640
   artifact;
-- the existing queue bot can enqueue a legacy-shaped request and does not
-  prevent the worker from completing it;
+- the source-mapped queue bot can enqueue an explicit pending request and
+  leaves worker-owned lifecycle fields untouched while displaying the queue;
+  automated tests cover a paced multipart `/queue` response for 70 active
+  requests;
 - the reviewed image-transfer path produces the recorded source checksum and
   image ID.
 
@@ -1331,8 +1370,10 @@ The following remain unresolved or only partially verified:
 
 - the MongoDB archive restored successfully, but no full NAS snapshot or NAS
   restore drill was available;
-- one successful queue-bot canary does not prove every additive lifecycle
-  state is rendered or left untouched correctly;
+- live Telegram receipt of the multipart `/queue` response still needs user
+  retry and confirmation because successful sends are not logged; additional
+  commands and uncommon lifecycle/error combinations also need representative
+  soak coverage;
 - external NAS writers are not yet fully inventoried and no replacement
   cataloging path has been implemented;
 - the legacy and one-off playlist writers have not yet been proved to own

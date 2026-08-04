@@ -1,8 +1,9 @@
 # `music-services` production state after the spotDL-primary cutover
 
-This document records the Harmoniq deployment that was cut over and validated
-on `music-services` on 2026-08-03. It is an as-deployed evidence record, not a
-generic installation guide. Secret values are intentionally omitted.
+This document records the Harmoniq worker deployment cut over and validated on
+`music-services` on 2026-08-03 and the Telegram queue-bot repair completed on
+2026-08-04. It is an as-deployed evidence record, not a generic installation
+guide. Secret values are intentionally omitted.
 
 For the pre-cutover VM snapshot and the migration design, see
 [`vm-infrastructure-current-state.md`](./vm-infrastructure-current-state.md)
@@ -22,10 +23,11 @@ yt-dlp, Deno, FFmpeg, and ffprobe all run in the same container. The host
 provides the read-only configuration, private writable runtime paths, local
 staging, and the NAS bind mount.
 
-The existing Telegram queue bot and n8n deployment were not folded into this
-Compose project. They remain independent workloads on the same VM. The legacy
-indexer and dynamic-playlist jobs remain stopped, as do all three legacy music
-cron entries.
+The Telegram queue bot and n8n deployment were not folded into this Compose
+project. They remain independent workloads on the same VM. The queue bot is
+now a source-mapped, healthy Linux/amd64 container; n8n was unchanged. The
+legacy indexer and dynamic-playlist jobs remain stopped, as do all three legacy
+music cron entries.
 
 ## Deployed artifact record
 
@@ -53,11 +55,33 @@ yt-dlp `2026.07.04`, Deno `2.9.4`, and FFmpeg `5.1.9`. `pull_policy: never`
 prevents an implicit registry pull, but the tag is still a mutable local name;
 operators must compare the image ID above before every recreate or rollback.
 
+### Telegram queue-bot artifact record
+
+| Item | As deployed |
+| --- | --- |
+| Repair date | 2026-08-04 |
+| Source revision | `97e6c4bdc1e00416286dab6cc37987c370be9dda` (`fix long telegram queue replies`) |
+| Source archive SHA-256 | `68f1b663edfb1b1aba1db1f92c057441857c3e2b613ed38d8e012dda975a9603` |
+| Image tag | `telegram-queue-bot:97e6c4bdc1e0-amd64` |
+| Image ID | `sha256:2d31845da18b617de1a5c2731b2258e5f4a5a7ee779dfbda12f17e7bfa732839` |
+| Image platform | Linux/amd64 |
+| Container | `telegram-queue-bot` |
+| Runtime | Standalone Docker container; bridge network; no mounts |
+| Published port | `0.0.0.0:8080` to container port `8080` |
+| Restart/logging | `unless-stopped`; `json-file` |
+| Runtime identity | Image `appuser` (UID 1000) |
+
+The upgrade preserved the seven existing application environment variables
+without printing their values. The active root-only environment file is
+`/etc/harmoniq/telegram-queue-bot.env`, mode `0600`. The protected pre-upgrade
+runtime copy and rollback evidence are under
+`/var/backups/harmoniq/97e6c4bdc1e0/telegram-queue-bot-upgrade`.
+
 ## Production topology
 
 ```mermaid
 flowchart LR
-    telegram["Telegram queue bot\nstandalone container"]
+    telegram["Telegram queue bot\nsource-mapped standalone container"]
     mongo[("Existing remote MongoDB\nmusic-services database")]
     n8n["Existing n8n\nstandalone container"]
 
@@ -220,22 +244,59 @@ corrected canary, it was moved intact to
 incident evidence. Production staging was then empty and remained empty after
 the corrected image completed the canary.
 
+### Telegram queue-bot repair and deployment evidence
+
+The bot process and its HTTP endpoints were live, but `/queue` rendered all
+active requests into one unbounded Telegram message. With 70 active requests,
+the response exceeded Telegram's single-message limit. Telegram rejected the
+send and the handler only logged the error, so the user received no queue
+reply even though the MongoDB query itself had completed.
+
+Revision `97e6c4b` keeps `/queue` as plain text and changes only its delivery
+path:
+
+- responses are split into UTF-8-safe chunks with a 4,000-byte content budget;
+- multipart replies are labeled `Черга — частина n/m` and sent in order;
+- consecutive parts are paced one second apart;
+- a Telegram HTTP 429 honors `RetryAfter` and retries that part exactly once;
+- any other send error, or a failed retry, stops later parts rather than
+  creating a silent gap;
+- queue rendering remains read-only with respect to worker-owned lifecycle,
+  lease, result, and error fields.
+
+Automated tests cover the 70-request multipart behavior, ordering, size and
+UTF-8 boundaries, stop-on-error behavior, and the single 429 retry. The
+replacement container reported `healthy` with restart count zero; its
+`/health`, `/ready`, and database-backed `/stats` probes succeeded, startup was
+clean, and no queue-send errors appeared in the inspected logs. Successful
+Telegram sends are not logged, so live receipt of the multipart response
+remains pending a user `/queue` retry and confirmation.
+
+The upgrade also corrected a separate packaging defect. The previous image
+was declared Linux/arm64 and contained an ARM64 Alpine `/bin/sh`, while its Go
+`/app/main` binary had been explicitly compiled for x86-64. The application
+binary could run on the amd64 VM, but every shell-form Docker healthcheck
+failed with `exec format error`, creating the long-standing false `unhealthy`
+state. The new BuildKit build targets Linux/amd64 for both the runtime base and
+binary, and the image-specific Docker ignore file excludes local credentials,
+editor state, and saved image archives from the build context.
+
 ## Service state at handoff
 
 | Workload | State | Notes |
 | --- | --- | --- |
 | `harmoniq-spotdl-wapper` | Running; restart count 0 | spotDL backend; worker-only Compose; no container healthcheck |
-| `telegram-queue-bot` | Running; restart count 0 | Standalone legacy container; process works and can enqueue |
+| `telegram-queue-bot` | Running; healthy; restart count 0 | Source-mapped Linux/amd64 image; 70-request multipart behavior covered by automated tests; live receipt pending |
 | `n8n-music-services` | Running | Existing deployment, unchanged by this cutover |
 | Legacy `/root/spotdl-wapper` cron | Disabled | Entry retained with `HARMONIQ_CUTOVER_DISABLED` for rollback |
 | Legacy `/root/music-indexer` cron | Disabled; process stopped | New worker catalogs its own imports synchronously |
 | Legacy `/root/dynamic-playlists` cron | Disabled; process stopped | Not replaced by the worker deployment |
 
-The Telegram container still reports Docker health `unhealthy`. Its inherited
-healthcheck calls a `/health` endpoint with `wget` and exits unsuccessfully;
-that signal is not evidence that the bot process is stopped. The process was
-running and the canary enqueue proved its main path, but the healthcheck must
-be corrected in a separate source-mapped bot deployment.
+The former Telegram container is retained stopped as
+`telegram-queue-bot-rollback-20260208`. It still references the exact mixed-
+architecture image and retains its original environment and runtime settings;
+it must never run concurrently with the current bot because both would long-
+poll the same Telegram token.
 
 ## Difference from the original VM deployment
 
@@ -248,7 +309,7 @@ be corrected in a separate source-mapped bot deployment.
 | Staging | Legacy/provider-managed behavior | Private host-local owned-attempt directories with marker-gated cleanup |
 | Runtime user | Root | UID/GID `1000:1000`, aligned with the CIFS mapping |
 | NAS safety | Direct host use of `/mnt/music` | Identical namespace plus CIFS mode hardening, mount preflight, and read-only in-container sentinel |
-| Queue producer | Standalone Telegram container | Unchanged standalone Telegram container |
+| Queue producer | Source-unmapped mixed-architecture image; false `unhealthy`; unbounded `/queue` reply | Source-mapped healthy Linux/amd64 standalone container with bounded multipart replies |
 | MongoDB | Existing remote database | Same database and collections, now with explicit claim/catalog indexes |
 | Provider choice | spotDL coupled to the legacy wrapper | Provider-neutral coordinator, with spotDL still selected as primary |
 
@@ -272,7 +333,13 @@ The root-only pre-cutover backup set is
 The corrected-worker upgrade evidence is under
 `/var/backups/harmoniq/66249d835202/worker-upgrade`, including the preserved
 `staging-residue.before` directory from the failed path-contract attempts.
-Keep both backup roots available through the rollback and incident-review
+The queue-bot upgrade evidence is under
+`/var/backups/harmoniq/97e6c4bdc1e0/telegram-queue-bot-upgrade`. That root-owned
+directory has mode `0700` and contains the pre-upgrade container/image records,
+the protected runtime environment, candidate evidence, and an exact saved copy
+of the old image at `telegram-queue-bot.rollback.tar`. That archive's SHA-256
+is `7060b13e0fae36cade72152088d6ad3941e53b6c9e5c67a615cc40f00c968289`.
+Keep all three backup roots available through the rollback and incident-review
 window.
 
 Rollback must preserve the single-writer invariant:
@@ -295,6 +362,16 @@ rollback: it contains the diagnosed dot-prefixed staging-path defect. The
 original root artifacts are the full pre-cutover fallback; the current
 `66249d8` image is the accepted container baseline.
 
+Queue-bot rollback is independent of worker rollback. Stop the current
+`telegram-queue-bot`, preserve it under a failed-candidate name for inspection,
+rename `telegram-queue-bot-rollback-20260208` back to
+`telegram-queue-bot`, and start it. Never overlap the two long pollers. The
+old container's Docker health will again be `unhealthy` because of its known
+mixed-architecture shell, so rollback acceptance uses the host `/health` and
+`/ready` responses plus a Telegram command. The saved image tar in the
+protected upgrade directory is the fallback if the stopped rollback container
+or old local image is lost.
+
 ## Remaining risks and required follow-up
 
 - Rotate the MongoDB, SMB, and Spotify credentials used during the cutover.
@@ -304,9 +381,8 @@ original root artifacts are the full pre-cutover fallback; the current
   procedure. Preserve mode `0600` on the runtime copy and `0440` on the
   canonical copy. Treat the root-only legacy backup containing cookies as
   sensitive for its entire retention period.
-- Replace the mutable `latest` images for the Telegram bot and n8n with
-  source-mapped immutable artifacts. Fix the Telegram health endpoint/check
-  so Docker health reflects the process's real readiness.
+- Replace the remaining mutable `n8n:latest` deployment with a source-mapped
+  immutable artifact. The Telegram bot is now source-mapped and healthy.
 - Add an off-host, restore-tested backup. The verified MongoDB archive and
   playlist tarball currently share the VM's failure domain.
 - Add monitoring for queue age, `needs_review`, retries, lease expiry, worker
