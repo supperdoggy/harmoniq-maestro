@@ -61,6 +61,24 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("Spotify API status %d: %s", e.StatusCode, e.Message)
 }
 
+type rateLimitTransport struct {
+	base http.RoundTripper
+}
+
+func (t rateLimitTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+
+	response, err := base.RoundTrip(request)
+	if err != nil || response == nil || response.StatusCode != http.StatusTooManyRequests {
+		return response, err
+	}
+
+	return nil, apiErrorFromResponse(response)
+}
+
 type SpotifyService interface {
 	GetObjectName(ctx context.Context, url string) (string, error)
 	GetObjectType(ctx context.Context, url string) (SpotifyObjectType, error)
@@ -105,6 +123,11 @@ func NewSpotifyServiceWithRefreshToken(ctx context.Context, clientID, clientSecr
 		}
 		httpClient = spotifyConfig.Client(ctx)
 	}
+	baseTransport := httpClient.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	httpClient.Transport = rateLimitTransport{base: baseTransport}
 	spotifyClient := spotify.New(httpClient)
 
 	return &spotifyService{
@@ -239,35 +262,12 @@ func (s *spotifyService) GetPlaylistTracks(ctx context.Context, url string) ([]s
 		}
 
 		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-			body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-			_ = response.Body.Close()
 			if response.StatusCode == http.StatusNotFound && !s.userAuth && len(playlistItems) == 0 {
+				_ = response.Body.Close()
 				return s.getLegacyPlaylistTracks(ctx, id)
 			}
 
-			apiError := &APIError{
-				StatusCode: response.StatusCode,
-				Message:    strings.TrimSpace(string(body)),
-			}
-			var errorBody struct {
-				Reason string `json:"reason"`
-				Error  struct {
-					Message string `json:"message"`
-					Reason  string `json:"reason"`
-				} `json:"error"`
-			}
-			if json.Unmarshal(body, &errorBody) == nil {
-				if errorBody.Error.Message != "" {
-					apiError.Message = errorBody.Error.Message
-				}
-				apiError.Reason = errorBody.Reason
-				if apiError.Reason == "" {
-					apiError.Reason = errorBody.Error.Reason
-				}
-			}
-			if retryAfterSeconds, err := strconv.Atoi(response.Header.Get("Retry-After")); err == nil {
-				apiError.RetryAfter = time.Duration(retryAfterSeconds) * time.Second
-			}
+			apiError := apiErrorFromResponse(response)
 			if response.StatusCode == http.StatusForbidden && !s.userAuth {
 				apiError.Message += "; configure a user refresh token for Development Mode playlists"
 			}
@@ -310,6 +310,64 @@ func (s *spotifyService) GetPlaylistTracks(ctx context.Context, url string) ([]s
 	}
 
 	return playlistItems, nil
+}
+
+func apiErrorFromResponse(response *http.Response) *APIError {
+	var body []byte
+	if response.Body != nil {
+		body, _ = io.ReadAll(io.LimitReader(response.Body, 4096))
+		_ = response.Body.Close()
+	}
+
+	apiError := &APIError{
+		StatusCode: response.StatusCode,
+		Message:    strings.TrimSpace(string(body)),
+		RetryAfter: parseRetryAfter(response.Header.Get("Retry-After"), time.Now()),
+	}
+	if apiError.Message == "" {
+		apiError.Message = http.StatusText(response.StatusCode)
+	}
+
+	var errorBody struct {
+		Reason string `json:"reason"`
+		Error  struct {
+			Message string `json:"message"`
+			Reason  string `json:"reason"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &errorBody) == nil {
+		if errorBody.Error.Message != "" {
+			apiError.Message = errorBody.Error.Message
+		}
+		apiError.Reason = errorBody.Reason
+		if apiError.Reason == "" {
+			apiError.Reason = errorBody.Error.Reason
+		}
+	}
+
+	return apiError
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		const maxDuration = time.Duration(1<<63 - 1)
+		if seconds > int64(maxDuration/time.Second) {
+			return maxDuration
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	when, err := http.ParseTime(value)
+	if err != nil || !when.After(now) {
+		return 0
+	}
+	return when.Sub(now)
 }
 
 func (s *spotifyService) getLegacyPlaylistTracks(ctx context.Context, id spotify.ID) ([]spotify.PlaylistItem, error) {
