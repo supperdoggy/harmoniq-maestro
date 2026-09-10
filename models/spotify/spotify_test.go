@@ -172,6 +172,35 @@ func TestGetPlaylistTracksPreservesQuotaClassification(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, time.September, 10, 12, 0, 0, 0, time.UTC)
+	future := now.Add(90 * time.Second).Format(http.TimeFormat)
+	past := now.Add(-time.Second).Format(http.TimeFormat)
+
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{name: "delta seconds", value: "17", want: 17 * time.Second},
+		{name: "HTTP date", value: future, want: 90 * time.Second},
+		{name: "surrounding whitespace", value: " 3 ", want: 3 * time.Second},
+		{name: "zero", value: "0", want: 0},
+		{name: "negative", value: "-2", want: 0},
+		{name: "past HTTP date", value: past, want: 0},
+		{name: "invalid", value: "later", want: 0},
+		{name: "empty", value: "", want: 0},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := parseRetryAfter(test.value, now); got != test.want {
+				t.Fatalf("parseRetryAfter(%q) = %s, want %s", test.value, got, test.want)
+			}
+		})
+	}
+}
+
 func TestNormalizeSDKErrorPreservesStatus(t *testing.T) {
 	err := normalizeSDKError(spotifyapi.Error{
 		Status:  http.StatusForbidden,
