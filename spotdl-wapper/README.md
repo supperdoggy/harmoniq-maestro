@@ -61,6 +61,21 @@ non-`no_pull` request with missing tracks stays active without consuming its
 error budget and does not publish a partial M3U. This path no longer waits for
 `index-status`.
 
+One-off playlist failures use a durable `next_attempt_at` schedule and typed
+`last_error`. `WORKER_RETRY_DELAY` is the minimum delay; a Spotify `429` waits
+for the larger of that value and `Retry-After`. The first four ordinary failed
+attempts remain active and scheduled, while the fifth deactivates the request.
+Legacy active rows without a schedule remain immediately eligible. Playlist
+selection considers only missing, null, or due schedules and is ordered by
+creation time and ID. This adds backoff, but not a claim or lease, so only one
+playlist-processing worker may run at a time.
+
+The worker stores the playlist `name` after Spotify returns it. The queue bot
+uses that cached value, falling back to the URL for legacy or not-yet-named
+rows, so rendering `/queue` does not spend another Spotify API request. A
+`no_pull` request still fetches Spotify name and item metadata; it suppresses
+only downloads for missing tracks.
+
 Downloads are drained before playlist work. Sustained download traffic can
 therefore delay one-off playlist processing, and a playlist can wait
 indefinitely when a missing track is held in review or successful request
@@ -76,7 +91,8 @@ Important controls are:
 - `MEDIA_OUTPUT_TEMPLATE` and `PLAYLISTS_OUTPUT_PATH`;
 - `ACQUISITION_STAGING_PATH`, `ACQUISITION_AUDIO_FORMAT`, and command timeout;
 - `SPOTDL_USE_CONFIG` for the default provider's standard-path configuration;
-- worker poll, lease, retry-delay, and attempt settings;
+- worker poll, lease, retry-delay, and download-attempt settings; playlist
+  retries share the delay but retain a fixed five-attempt budget;
 - `SPOTIFY_REFRESH_TOKEN` for current Development Mode playlist reads.
 
 `DESTINATION` remains only as a deprecated fallback for
