@@ -35,9 +35,13 @@
   Defaults to `45m` and must be at least `3s`. A claimed request is renewed at
   one-third of this duration, bounded to an interval between `1s` and `30s`.
 - `WORKER_RETRY_DELAY`: Backoff before retrying a retryable request, using Go
-  duration syntax. Defaults to `15m` and must be greater than zero. It also
-  applies while retrying catalog finalization for an already published
-  recovery-journal artifact.
+  duration syntax. Defaults to `15m` and must be greater than zero. This is the
+  minimum delay for both download requests and ordinary one-off playlist
+  failures, and it also applies while retrying catalog finalization for an
+  already published recovery-journal artifact. A Spotify `429` uses the larger
+  of this value and the API's `Retry-After`; the header may extend the delay but
+  never shorten it. Playlist retry time is persisted in `next_attempt_at`, so
+  the faster `WORKER_POLL_INTERVAL` does not bypass the backoff after restart.
 - `WORKER_MAX_ATTEMPTS`: Maximum budget-consuming acquisition-pipeline failures
   before the request is moved to `failed`. Retryable metadata, resolution,
   download, and pre-publication import failures consume this budget;
@@ -45,7 +49,8 @@
   has been published and entered recovery-journal/catalog finalization,
   retryable finalization failures back off without incrementing this counter,
   so they can continue beyond the configured limit. Defaults to `3` and must
-  be at least `1`.
+  be at least `1`. This setting does not control one-off `playlist-requests`,
+  which retain their compatibility limit of five ordinary failed attempts.
 - `SLEEP_IN_MINUTES`: Legacy delay between individual requests inside one
   processing pass. Defaults to `1`; set `0` to disable it.
 
