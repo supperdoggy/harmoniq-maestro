@@ -801,6 +801,11 @@ func (d *db) EnsureIndexes(ctx context.Context) error {
 		indexErrors = append(indexErrors, fmt.Errorf("create queue claim index: %w", err))
 	}
 
+	_, err = database.Collection("playlist-requests").Indexes().CreateOne(ctx, playlistRetryIndex())
+	if err != nil {
+		indexErrors = append(indexErrors, fmt.Errorf("create playlist retry index: %w", err))
+	}
+
 	musicIndexes := []mongo.IndexModel{
 		{
 			Keys: bson.D{{Key: "spotify_id", Value: 1}},
@@ -821,6 +826,18 @@ func (d *db) EnsureIndexes(ctx context.Context) error {
 	}
 
 	return errors.Join(indexErrors...)
+}
+
+func playlistRetryIndex() mongo.IndexModel {
+	return mongo.IndexModel{
+		Keys: bson.D{
+			{Key: "active", Value: 1},
+			{Key: "next_attempt_at", Value: 1},
+			{Key: "created_at", Value: 1},
+			{Key: "_id", Value: 1},
+		},
+		Options: options.Index().SetName("playlist_retry_eligibility_v1"),
+	}
 }
 
 // escapeRegex escapes special regex characters in a string

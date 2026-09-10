@@ -92,3 +92,25 @@ func TestPlaylistRequestUpdateClearsOptionalMetadata(t *testing.T) {
 		t.Fatalf("playlist clearing update mismatch:\n got: %#v\nwant: %#v", got, want)
 	}
 }
+
+func TestPlaylistRetryIndexContract(t *testing.T) {
+	index := playlistRetryIndex()
+	wantKeys := bson.D{
+		{Key: "active", Value: 1},
+		{Key: "next_attempt_at", Value: 1},
+		{Key: "created_at", Value: 1},
+		{Key: "_id", Value: 1},
+	}
+	if !reflect.DeepEqual(index.Keys, wantKeys) {
+		t.Fatalf("playlist retry index keys = %#v, want %#v", index.Keys, wantKeys)
+	}
+	if index.Options == nil || index.Options.Name == nil || *index.Options.Name != "playlist_retry_eligibility_v1" {
+		t.Fatalf("playlist retry index name = %#v", index.Options)
+	}
+	if index.Options.Sparse != nil && *index.Options.Sparse {
+		t.Fatal("playlist retry index must not be sparse because legacy rows have no schedule")
+	}
+	if index.Options.Unique != nil && *index.Options.Unique {
+		t.Fatal("playlist retry index must not be unique")
+	}
+}
