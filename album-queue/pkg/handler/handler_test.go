@@ -227,20 +227,34 @@ func TestHandleQueue_RendersProgressWithoutMutatingWorkerJob(t *testing.T) {
 }
 
 func TestHandleQueueUsesPersistedPlaylistStatusWithoutSpotifyLookup(t *testing.T) {
+	nextAttemptAt := time.Now().UTC().Add(2 * time.Hour).Unix()
 	database := &fakeDatabase{
 		activeByURL: map[string]bool{},
 		activePlaylists: []models.PlaylistRequest{
 			{
-				ID:         "playlist-1",
-				SpotifyURL: "https://open.spotify.com/playlist/cached",
-				Name:       "Cached playlist name",
-				Active:     true,
+				ID:            "playlist-1",
+				SpotifyURL:    "https://open.spotify.com/playlist/cached",
+				Name:          "Cached playlist name",
+				Active:        true,
+				Errored:       true,
+				RetryCount:    2,
+				NextAttemptAt: nextAttemptAt,
+				LastError: &models.DownloadRequestError{
+					Code:    "spotify_rate_limited",
+					Message: "sensitive upstream detail must not be rendered",
+				},
 			},
 			{
-				ID:         "playlist-2",
-				SpotifyURL: "https://open.spotify.com/playlist/fallback",
-				Name:       "  ",
-				Active:     true,
+				ID:            "playlist-2",
+				SpotifyURL:    "https://open.spotify.com/playlist/fallback",
+				Name:          "  ",
+				Active:        true,
+				Errored:       true,
+				RetryCount:    1,
+				NextAttemptAt: 1,
+				LastError: &models.DownloadRequestError{
+					Code: "unsafe\ncode",
+				},
 			},
 		},
 	}
@@ -261,13 +275,22 @@ func TestHandleQueueUsesPersistedPlaylistStatusWithoutSpotifyLookup(t *testing.T
 	for _, expected := range []string{
 		"Cached playlist name",
 		"https://open.spotify.com/playlist/fallback",
+		"spotify_rate_limited",
+		time.Unix(nextAttemptAt, 0).UTC().Format(time.RFC3339),
 	} {
 		if !strings.Contains(reply, expected) {
 			t.Errorf("queue reply does not contain %q: %q", expected, reply)
 		}
 	}
-	if strings.Contains(reply, "live Spotify name") {
-		t.Errorf("queue reply unexpectedly contains a live Spotify name: %q", reply)
+	for _, unexpected := range []string{
+		"live Spotify name",
+		"sensitive upstream detail",
+		"unsafe\ncode",
+		time.Unix(1, 0).UTC().Format(time.RFC3339),
+	} {
+		if strings.Contains(reply, unexpected) {
+			t.Errorf("queue reply unexpectedly contains %q: %q", unexpected, reply)
+		}
 	}
 }
 

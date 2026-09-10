@@ -379,12 +379,38 @@ func (h *handler) HandleQueue(m *telebot.Message) {
 			}
 			if p.Errored {
 				response += fmt.Sprintf("   ⚠️ Помилки: %d\n", p.RetryCount)
+				if p.LastError != nil {
+					if code := safePlaylistErrorCode(p.LastError.Code); code != "" {
+						response += fmt.Sprintf("   🧩 Код: %s\n", code)
+					}
+				}
+			}
+			if p.NextAttemptAt > time.Now().Unix() {
+				nextAttempt := time.Unix(p.NextAttemptAt, 0).UTC().Format(time.RFC3339)
+				response += fmt.Sprintf("   ⏳ Наступна спроба: %s\n", nextAttempt)
 			}
 			response += "\n"
 		}
 	}
 
 	h.replyQueue(m, response)
+}
+
+func safePlaylistErrorCode(code string) string {
+	code = strings.TrimSpace(code)
+	if code == "" || len(code) > 64 {
+		return ""
+	}
+	for _, character := range code {
+		if character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' ||
+			character == '_' || character == '-' || character == '.' {
+			continue
+		}
+		return ""
+	}
+	return code
 }
 
 func (h *handler) HandleFailed(m *telebot.Message) {
