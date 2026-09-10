@@ -362,10 +362,11 @@ func (h *handler) HandleQueue(m *telebot.Message) {
 		}
 		response += "Активні запити на плейлисти:\n\n"
 		for _, p := range playlists {
-			// Try to get playlist name
-			playlistName, err := h.spotifyService.GetObjectName(ctx, p.SpotifyURL)
-			if err != nil {
-				h.log.Error("Failed to get playlist name", zap.Error(err))
+			// Queue inspection must not consume Spotify quota. The worker persists
+			// the name when it successfully resolves the playlist; legacy and
+			// not-yet-resolved requests fall back to their canonical URL.
+			playlistName := strings.TrimSpace(p.Name)
+			if playlistName == "" {
 				playlistName = p.SpotifyURL
 			}
 
