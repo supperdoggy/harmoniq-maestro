@@ -380,7 +380,7 @@ The worker dual-writes legacy flags:
 
 This keeps older readers usable while making `state` authoritative.
 
-### Retry classification
+### Download-request retry classification
 
 Each claim increments `sync_count`. Retryable metadata, resolution, download,
 and pre-publication import failures increment `retry_count`; after
@@ -394,24 +394,26 @@ lease renewal, catalog upsert, or catalog-result persistence failures enter
 therefore continue beyond `WORKER_MAX_ATTEMPTS` rather than strand a valid
 published artifact.
 
-Spotify errors receive special handling:
+Spotify errors in the download-request pipeline receive special handling:
 
-- `429` is retryable; the direct playlist-items request honors `Retry-After`
-  when it is longer than the configured delay;
+- `429` is retryable and uses the larger of `WORKER_RETRY_DELAY` and
+  `Retry-After`;
 - `401` and `403` move to `needs_review`;
 - `400` and `404` move to `needs_review`;
 - `5xx` errors retry;
 - other classified `4xx` errors require review.
 
 Errors returned by the Spotify SDK are normalized to the same status-carrying
-API error type, so status classification applies consistently, but the SDK
-error does not expose `Retry-After`. No acceptable candidate, legacy skipped
-tracks, missing canonical track URLs, invalid assets, unsafe output paths,
-provider-checksum mismatches, publish collisions, and duration mismatches also
-require review. Provider execution and pre-publication persistence errors are
-retryable and budget-consuming; published-artifact catalog finalization is
-retryable but preserves the budget. Cancellation schedules immediate retry
-without consuming the retry budget.
+API error type, so status classification applies consistently. The shared HTTP
+transport intercepts SDK-backed `429` responses before the SDK discards their
+headers, and the direct playlist-items path uses the same parser. Both numeric
+seconds and HTTP-date `Retry-After` values are supported. No acceptable
+candidate, legacy skipped tracks, missing canonical track URLs, invalid assets,
+unsafe output paths, provider-checksum mismatches, publish collisions, and
+duration mismatches also require review. Provider execution and
+pre-publication persistence errors are retryable and budget-consuming;
+published-artifact catalog finalization is retryable but preserves the budget.
+Cancellation schedules immediate retry without consuming the retry budget.
 
 The current attempt budget is request-wide rather than independently budgeted
 per metadata, resolution, download, and validation stage. Catalog finalization
@@ -448,9 +450,19 @@ not currently unique or separately indexed here.
 
 ### `playlist-requests`
 
-This remains a legacy boolean/counter queue: URL, creator, `active`, `errored`,
-`retry_count`, and `no_pull`. It does not yet use the download queue's atomic
-claim, lease, typed errors, or explicit states.
+This retains its legacy boolean/counter coordination but adds optional `name`,
+`next_attempt_at`, and typed `last_error` fields to URL, creator, `active`,
+`errored`, `retry_count`, and `no_pull`. The additive fields require no
+backfill: an active document with a missing or null schedule is immediately
+eligible, as is one whose Unix-UTC schedule is due. Eligible rows are ordered
+by `created_at` and `_id`.
+
+The worker stores the Spotify playlist name after a successful metadata read.
+This is a presentation cache for the queue bot, not a cache of playlist
+contents. The collection still has no explicit state, atomic claim, owner, or
+lease, so more than one playlist-processing worker can process the same row.
+The non-sparse, non-unique `playlist_retry_eligibility_v1` index uses
+`{active: 1, next_attempt_at: 1, created_at: 1, _id: 1}`.
 
 ### `index-status`
 
@@ -460,18 +472,22 @@ playlist flows no longer read or write `index-status`. Synchronous importer
 catalog upsert replaced the indexer gate for worker-acquired files.
 
 Index creation is best effort. Duplicate legacy Spotify IDs can prevent the
-unique index from being created without preventing startup; operators must
-inspect the warning and clean the data before retrying index creation.
+unique music index from being created without preventing startup, and any
+playlist-index creation error is also non-fatal. Operators must inspect startup
+warnings and verify the complete index definitions rather than treating a
+running process as proof that index creation succeeded.
 
 ## One-off playlist behavior
 
 One-off processing is implemented in
 [`playlist_requests.go`](../spotdl-wapper/pkg/service/playlist_requests.go):
 
-1. Read active `playlist-requests`.
+1. Read active `playlist-requests` whose `next_attempt_at` is missing, null, or
+   due, ordered by creation time and ID.
 2. Defer a playlist while a download request for the same Spotify playlist URL
    remains active.
-3. Fetch the current playlist name and items from Spotify.
+3. Reuse a stored playlist name or fetch and persist it when absent, then fetch
+   the current items from Spotify.
 4. Resolve catalog paths by case-insensitive exact artist/title matching,
    including a first-artist fallback.
 5. If the catalog is empty, treat every usable playlist track as missing.
@@ -490,9 +506,29 @@ root even through parent-directory symlinks. It flushes a temporary file,
 atomically replaces the playlist, and syncs the playlist output directory.
 
 An empty `no_pull` playlist produces a valid empty M3U. Waiting for missing
-files is expected coordination: it does not set `errored`, increment
-`retry_count`, or deactivate the playlist. Other errors increment the legacy
-retry counter and deactivate the request after five failed passes.
+files is expected coordination: it clears stale retry scheduling and error
+metadata, does not set `errored`, does not increment or reset `retry_count`, and
+does not deactivate the playlist. A successful M3U also clears stale retry
+metadata and deactivates the request.
+
+Every other failure records a retryable typed error at stage `playlist`,
+increments the compatibility retry counter, and schedules another attempt no
+sooner than `WORKER_RETRY_DELAY`. Spotify `429` failures use code
+`spotify_rate_limited` and the larger of the configured delay and
+`Retry-After`; when Spotify supplies a reason it is stored as
+`last_error.details.reason`. Other failures use code `playlist_processing`.
+Attempts one through four remain active. The fifth failed attempt deactivates
+the request, retains the final `last_error`, and clears `next_attempt_at`.
+Restarting the worker does not reset this durable schedule or budget.
+
+Worker cancellation or deadline expiry stops the playlist pass without
+consuming an attempt or overwriting the row. A due request therefore remains
+eligible after a graceful restart.
+
+`no_pull` controls only whether missing tracks produce child download requests.
+The worker still needs Spotify name metadata and current items; an uncached
+request fetches both, while a cached request still fetches the items. `no_pull`
+work is therefore subject to the same rate-limit scheduling.
 
 Waiting can be indefinite. Duplicate suppression treats some existing
 download-request histories, including review or successful records, as already
@@ -513,15 +549,21 @@ Playlist contents use the current paginated
 under client credentials falls back to the legacy client route for
 compatibility. Local, null, empty-ID, non-track, and explicitly unplayable
 items are excluded. Errors from the Spotify SDK are normalized into the
-worker's status-carrying API error. The direct playlist-items request also
-preserves `Retry-After` and Spotify's reason field; those fields are not
-available from the SDK's error type.
+worker's status-carrying API error. The shared transport captures Spotify `429`
+responses, including `Retry-After` and the reason field, before SDK-backed
+metadata calls discard response headers. The direct playlist-items path uses
+the same error parser. A valid `Retry-After` can be delta seconds or an HTTP
+date; invalid, zero, negative, or already elapsed values fall back to the
+configured retry floor.
 
 Spotify Development Mode playlist reads require user authorization and are
 limited by Spotify's current ownership/collaboration rules. The repository
 accepts a refresh token but does not implement the interactive authorization
-flow that obtains one. There is no application-level metadata cache; quota
-control currently relies on request scheduling and retry classification. See
+flow that obtains one. Playlist contents are not cached. A successfully read
+one-off playlist name is stored on its request so `/queue` can render the name
+without making another Spotify call; legacy and not-yet-named rows render their
+URL. Quota control otherwise relies on request scheduling and retry
+classification. See
 Spotify's
 [February 2026 migration guide](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide)
 and [API changelog](https://developer.spotify.com/documentation/web-api/references/changes/february-2026).
@@ -539,6 +581,10 @@ are:
   bind path);
 - `DESTINATION` is only a deprecated media-template alias;
 - `WORKER_POLL_INTERVAL` controls ticker cadence;
+- `WORKER_RETRY_DELAY` is the minimum durable delay for both download and
+  one-off playlist retries; Spotify `Retry-After` may extend it;
+- `WORKER_MAX_ATTEMPTS` controls download requests only; one-off playlists keep
+  their fixed five-failure compatibility limit;
 - `SLEEP_IN_MINUTES` only throttles requests within a drain.
 
 The image defaults to non-root UID 10001. The production VM explicitly runs
@@ -608,7 +654,9 @@ Loki delivery starts at info-level.
    duration agreement, but there is no codec allowlist, bitrate floor,
    loudness policy, artwork requirement, or explicit tag-schema version.
 8. **One-off playlist jobs retain legacy coordination.** They have no claim or
-   lease. Missing files no longer consume their error budget or produce a
+   lease. Durable due-time filtering prevents a Spotify rate limit from being
+   retried every poll, but it does not prevent two workers from processing the
+   same due row. Missing files do not consume their error budget or produce a
    partial non-`no_pull` M3U, but dependency history without a usable catalog
    file can leave them active forever. A continuously replenished download
    queue can also starve playlist processing.
@@ -646,11 +694,14 @@ The wrapper now has unit/contract coverage for:
 - request completion, no-candidate review, retry exhaustion, Spotify
   `Retry-After`, stable-identity catalog prechecks, invalid-catalog-file
   rejection, imported recovery journaling, and catalog-resume behavior;
-- empty-catalog/no-pull and missing-file wait behavior, safe filenames,
-  symlink-safe contained M3U entries, and durable atomic replacement;
+- empty-catalog/no-pull, missing-file wait, durable playlist retry scheduling,
+  five-attempt exhaustion, legacy schedule eligibility, typed playlist errors,
+  cached-name queue rendering, safe filenames, symlink-safe contained M3U
+  entries, and durable atomic replacement;
 - configuration defaults and validation;
 - the current Spotify `/items` response, local/unplayable item filtering, SDK
-  error normalization, and error classification.
+  error normalization, seconds/date `Retry-After` parsing, and error
+  classification.
 
 The remaining test gap is a container-level, real-MongoDB and real-tool
 end-to-end test covering request creation through final M3U output. Production
