@@ -104,6 +104,8 @@ type PlaylistRequest struct {
 	// NoPull indicates that the playlist missing songs should not be pulled from Spotify
 	NoPull bool `json:"no_pull" bson:"no_pull"`
 
-	CreatedAt int64 `json:"created_at" bson:"created_at"`
-	UpdatedAt int64 `json:"updated_at" bson:"updated_at"`
+	CreatedAt     int64                 `json:"created_at" bson:"created_at"`
+	UpdatedAt     int64                 `json:"updated_at" bson:"updated_at"`
+	NextAttemptAt int64                 `json:"next_attempt_at,omitempty" bson:"next_attempt_at,omitempty"`
+	LastError     *DownloadRequestError `json:"last_error,omitempty" bson:"last_error,omitempty"`
 }

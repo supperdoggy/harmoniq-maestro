@@ -49,13 +49,24 @@ func TestDownloadQueueRequest_JSON(t *testing.T) {
 
 func TestPlaylistRequest_JSON(t *testing.T) {
 	req := PlaylistRequest{
-		ID:         "playlist-id-456",
-		CreatorID:  67890,
-		SpotifyURL: "https://open.spotify.com/playlist/test",
-		Active:     true,
-		Errored:    false,
-		NoPull:     true,
-		CreatedAt:  time.Now().Unix(),
+		ID:            "playlist-id-456",
+		CreatorID:     67890,
+		SpotifyURL:    "https://open.spotify.com/playlist/test",
+		Name:          "Focus",
+		Active:        true,
+		Errored:       true,
+		RetryCount:    1,
+		NoPull:        true,
+		CreatedAt:     time.Now().Unix(),
+		UpdatedAt:     time.Now().Unix(),
+		NextAttemptAt: time.Now().Add(time.Hour).Unix(),
+		LastError: &DownloadRequestError{
+			Code:       "spotify_rate_limited",
+			Stage:      "playlist",
+			Message:    "quota exhausted",
+			Retryable:  true,
+			OccurredAt: time.Now().Unix(),
+		},
 	}
 
 	data, err := json.Marshal(req)
@@ -68,8 +79,49 @@ func TestPlaylistRequest_JSON(t *testing.T) {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
 
-	if decoded.NoPull != req.NoPull {
-		t.Errorf("NoPull mismatch: got %v, want %v", decoded.NoPull, req.NoPull)
+	if !reflect.DeepEqual(decoded, req) {
+		t.Fatalf("playlist metadata mismatch:\n got: %#v\nwant: %#v", decoded, req)
+	}
+}
+
+func TestPlaylistRequest_LegacyDocumentCompatibility(t *testing.T) {
+	req := PlaylistRequest{
+		ID:         "legacy-playlist",
+		SpotifyURL: "https://open.spotify.com/playlist/legacy",
+		Active:     true,
+		CreatedAt:  123,
+	}
+
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal legacy playlist JSON: %v", err)
+	}
+	for _, field := range []string{`"name"`, `"next_attempt_at"`, `"last_error"`} {
+		if strings.Contains(string(jsonData), field) {
+			t.Errorf("zero-value playlist field %s unexpectedly written to legacy JSON: %s", field, jsonData)
+		}
+	}
+
+	bsonData, err := bson.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal legacy playlist BSON: %v", err)
+	}
+	var document bson.M
+	if err := bson.Unmarshal(bsonData, &document); err != nil {
+		t.Fatalf("decode legacy playlist BSON: %v", err)
+	}
+	for _, field := range []string{"name", "next_attempt_at", "last_error"} {
+		if _, exists := document[field]; exists {
+			t.Errorf("zero-value playlist field %q unexpectedly written to legacy BSON", field)
+		}
+	}
+
+	var decoded PlaylistRequest
+	if err := bson.Unmarshal(bsonData, &decoded); err != nil {
+		t.Fatalf("unmarshal legacy playlist BSON: %v", err)
+	}
+	if decoded.Name != "" || decoded.NextAttemptAt != 0 || decoded.LastError != nil {
+		t.Fatalf("legacy playlist acquired unexpected retry metadata: %+v", decoded)
 	}
 }
 
