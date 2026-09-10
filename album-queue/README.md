@@ -89,6 +89,23 @@ SPOTIFY_REFRESH_TOKEN="" \
 - `/unsubscribe <url>`
 - `/subscriptions`
 
+### Playlist enqueue and display
+
+`/p` and `/pnp` acknowledge that a one-off playlist request was inserted into
+MongoDB; the acknowledgement does not prove that Spotify metadata was fetched
+or that an M3U was written. `no_pull` means that the worker will not enqueue
+downloads for missing tracks. It does not eliminate the Spotify name and item
+requests needed to materialize the playlist.
+
+For active one-off playlists, `/queue` renders the persisted `name` populated
+by the worker and falls back to the Spotify URL when a legacy or newly queued
+row has no cached name. It does not call Spotify merely to display a playlist.
+This avoids adding metadata traffic while Spotify has asked the worker to back
+off. Active playlist rows can include a future `next_attempt_at`, so “active”
+does not necessarily mean runnable on the current worker pass. The reply shows
+a future retry time in UTC and, when present, only a sanitized machine error
+code; it never includes the persisted raw error message or details.
+
 ### Large `/queue` responses
 
 `/queue` is plain text and does not update worker-owned lifecycle, lease,
