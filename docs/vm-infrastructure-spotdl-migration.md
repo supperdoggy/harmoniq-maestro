@@ -8,6 +8,12 @@ Telegram queue bot was repaired on 2026-08-04. Their authoritative post-
 cutover topology and evidence are recorded in
 [`vm-infrastructure-production-state.md`](./vm-infrastructure-production-state.md).
 
+The repository now also contains an additive one-off playlist retry change
+described in this runbook. That change is a local upgrade candidate, not part
+of the deployed `66249d8` worker or the recorded production state. Commands and
+checks specific to it are labeled as a subsequent upgrade and must not be read
+as evidence that production already has the new fields or index.
+
 Read these companion documents first:
 
 - [`vm-infrastructure-current-state.md`](./vm-infrastructure-current-state.md)
@@ -90,6 +96,10 @@ processes are stopped. The worker-only Compose project does not start MongoDB,
 a queue bot, an indexer, or dynamic playlists and publishes no network port.
 spotDL is not invoked on the host: the Go coordinator starts the pinned spotDL
 CLI as a child process inside the worker container.
+
+The deployed image predates the playlist `name`, `next_attempt_at`, and
+`last_error` additions. It selects every `active=true` one-off playlist on each
+worker pass and does not honor Spotify `Retry-After` for that orchestration.
 
 ### Telegram queue-bot repair as deployed
 
@@ -369,6 +379,7 @@ Do not call a backup verified solely because its creation command exited zero.
 | spotDL only | `ACQUISITION_BACKEND=spotdl` | First stage and rollback-compatible baseline |
 | Current media format from the copied config and accepted canary | `ACQUISITION_AUDIO_FORMAT=m4a` | The accepted canary produced and validated AAC audio in an M4A container |
 | Hourly cron plus 55-minute whole-process timeout | Long-running service; `WORKER_POLL_INTERVAL=1m`, initially `ACQUISITION_COMMAND_TIMEOUT=55m` | The new timeout is per downloader/FFmpeg/FFprobe command, so the semantics are not identical; measure and tighten it after the compatibility soak |
+| No durable one-off playlist delay | `WORKER_RETRY_DELAY=15m` as the retry floor | In the post-Stage-A candidate this also schedules ordinary playlist failures; Spotify `Retry-After` can extend but never shorten it, while playlists retain a fixed five-failure budget |
 | `SLEEP_IN_MINUTES=0` | `SLEEP_IN_MINUTES=0` | Preserve current no-delay behavior between requests |
 | `/root/.spotdl/config.json` | Root-owned read-only canonical copy mounted at both supported container paths | `SPOTDL_USE_CONFIG=true` is a boolean, not a file path; writable temp and runtime-cookie overlays are separate |
 | `BLOB_ENABLED=false` | Remove | The new worker does not consume this setting |
@@ -379,7 +390,11 @@ The new worker also requires explicit lease, retry, matching, FFmpeg, and
 Spotify settings. Do not depend on `.env.example` defaults in production.
 Verify the Spotify client credentials from the container network before the
 canary, and supply a user `SPOTIFY_REFRESH_TOKEN` when current Development Mode
-playlist reads require it.
+playlist reads require it. In the post-Stage-A retry implementation,
+`WORKER_RETRY_DELAY` is also the minimum delay for ordinary one-off playlist
+failures; a Spotify `Retry-After` may extend but never shorten it. Playlist
+requests retain a fixed five-failure budget independent of
+`WORKER_MAX_ATTEMPTS`.
 
 ## Release preparation
 
@@ -568,7 +583,10 @@ PLAYLISTS_OUTPUT_PATH=/mnt/music/Job-downloaded/Playlists
 WORKER_ID=music-services-spotdl-01
 WORKER_POLL_INTERVAL=1m
 WORKER_LEASE_DURATION=45m
+# Minimum for download and one-off playlist retries. Spotify Retry-After may
+# extend this value.
 WORKER_RETRY_DELAY=15m
+# Download-request limit only; one-off playlists retain five failed attempts.
 WORKER_MAX_ATTEMPTS=3
 SLEEP_IN_MINUTES=0
 
@@ -785,24 +803,58 @@ backlog is not a one-track canary.
 
 The same worker also processes active one-off playlist requests after downloads
 are drained. Such a request can enqueue child downloads and write an M3U even
-when the download queue was empty. Inventory it explicitly:
+when the download queue was empty. For the post-Stage-A retry upgrade, inventory
+all active rows and distinguish due from intentionally deferred work. Existing
+documents without the additive fields are valid and immediately due:
 
 ```javascript
-db.getCollection("playlist-requests").find(
+const playlistNow = Math.floor(Date.now() / 1000)
+const playlistRequests = db.getCollection("playlist-requests")
+
+playlistRequests.find(
   {active: true},
   {
     spotify_url: 1,
+    name: 1,
     no_pull: 1,
     errored: 1,
     retry_count: 1,
+    next_attempt_at: 1,
+    "last_error.code": 1,
+    "last_error.stage": 1,
+    "last_error.retryable": 1,
+    "last_error.occurred_at": 1,
     created_at: 1,
     updated_at: 1
   }
-)
+).sort({next_attempt_at: 1, created_at: 1, _id: 1})
+
+playlistRequests.countDocuments({
+  active: true,
+  $or: [
+    {next_attempt_at: {$exists: false}},
+    {next_attempt_at: null},
+    {next_attempt_at: {$lte: playlistNow}}
+  ]
+})
+
+playlistRequests.countDocuments({
+  active: true,
+  next_attempt_at: {$gt: playlistNow}
+})
+
+playlistRequests.countDocuments({
+  active: true,
+  "last_error.code": "spotify_rate_limited"
+})
 ```
 
-The first launch must have no active playlist request except an explicitly
-bounded canary whose possible child requests and output path are approved.
+Do not include `last_error.message` or `last_error.details` in routine shared
+diagnostics because they can contain user/source data. `next_attempt_at` is a
+Unix-UTC value; compare VM and MongoDB time before using it to declare work
+overdue. The first launch or upgrade must have no due playlist request except
+an explicitly bounded canary whose possible child requests and output path are
+approved. Future-scheduled rows are active but deliberately not runnable.
 
 ### Audit catalog identities
 
@@ -861,6 +913,10 @@ After the database backup is complete and legacy catalog writers are paused,
 create the indexes as an explicit, reviewed maintenance operation rather than
 letting worker startup create them unexpectedly:
 
+The playlist index below belongs to the post-Stage-A local implementation. Do
+not infer from this runbook that it exists in production; verify the live index
+list before and after the separately approved upgrade.
+
 ```javascript
 db.getCollection("download-queue-requests").createIndex(
   {
@@ -873,6 +929,16 @@ db.getCollection("download-queue-requests").createIndex(
     created_at: 1
   },
   {name: "queue_claim_eligibility_v2"}
+)
+
+db.getCollection("playlist-requests").createIndex(
+  {
+    active: 1,
+    next_attempt_at: 1,
+    created_at: 1,
+    _id: 1
+  },
+  {name: "playlist_retry_eligibility_v1"}
 )
 
 db.getCollection("music-files").createIndex(
@@ -891,6 +957,9 @@ force index creation. Record the complete `getIndexes()` output and verify, not
 only the names:
 
 - the exact queue key order shown above;
+- `playlist_retry_eligibility_v1` has the exact key order shown above and is
+  neither sparse nor unique, so legacy rows without `next_attempt_at` remain
+  represented;
 - `music_spotify_id_unique_sparse` has both `unique: true` and `sparse: true`;
 - `music_checksum_sparse` is sparse and is not unique.
 
@@ -1083,6 +1152,25 @@ docker logs --since 15m harmoniq-spotdl-wapper
 There is no readiness endpoint. A running container is necessary but not
 sufficient.
 
+For a subsequent deployment of the local playlist retry change, keep producers
+paused until the due/deferred inventory and exact playlist index definition
+have been checked. Prove the Spotify `429` path with deterministic tests or an
+isolated environment; do not deliberately exhaust production quota. If a
+naturally occurring production `429` is used as additional evidence, verify
+that the request remains active before attempt five, has
+`last_error.code=spotify_rate_limited`, and has a future `next_attempt_at` at
+least `WORKER_RETRY_DELAY` away and no earlier than Spotify requested. Confirm
+that repeated worker polls and a graceful restart do not call Spotify before
+that due time. On the fifth due failure, verify that the row becomes inactive,
+retains its final error, and clears the schedule.
+
+Also verify a bounded successful playlist and a missing-file wait. Both must
+clear stale retry metadata; missing-file waiting must not increment or reset
+the existing retry counter. The queue bot must render the persisted playlist
+name, or the URL when the name is absent, without making a Spotify metadata
+call. An enqueue acknowledgement from `/p` or `/pnp` is not proof that the M3U
+was materialized.
+
 After the worker acceptance and the 2026-08-04 queue-bot repair, both
 `harmoniq-spotdl-wapper` and `telegram-queue-bot` were running with restart
 count zero, the queue bot reported healthy, and n8n remained running. The
@@ -1103,6 +1191,8 @@ For every canary, verify:
 - a normal graceful restart preserves completed work and releases any current
   claim correctly;
 - one-off M3U replacement produces valid, host-readable entries;
+- active one-off playlists are partitioned into due and deferred counts, and a
+  deferred `429` is not described as a stopped worker;
 - the source-mapped queue bot does not write progress/lifecycle fields while
   rendering the queue, and it and the dynamic-playlist consumer tolerate the
   additive schema and stored paths;
@@ -1256,6 +1346,16 @@ image and its exact `ACQUISITION_BACKEND=spotdl` configuration. Stop the current
 service, restore the recorded image digest and root-owned configuration, and
 force a recreate:
 
+The deployed `66249d8` image predates playlist `next_attempt_at` filtering. It
+queries every `active=true` playlist on each worker poll, so rolling back while
+future-scheduled rows exist would bypass their backoff and can rapidly consume
+the rest of the five-attempt budget. Before restoring that image, pause playlist
+producers, stop the new worker, and inventory every active playlist with a
+future schedule. Decide each row's disposition explicitly; do not bulk clear
+schedules, reset counters, reactivate terminal failures, or start old and new
+workers together. Leaving the additive fields in MongoDB is harmless, but the
+old worker does not honor them.
+
 ```bash
 docker compose \
   --env-file /etc/harmoniq/deploy.env \
@@ -1382,8 +1482,8 @@ The following remain unresolved or only partially verified:
 - the VM-local image is identified by an exact image ID and source archive,
   but a registry digest and off-guest retained image artifact are still
   preferable;
-- readiness, queue-depth, staging-capacity, mount-loss, and provider-error
-  monitoring are not implemented.
+- readiness, queue-depth, staging-capacity, mount-loss, provider-error, and
+  one-off playlist due/deferred/rate-limit monitoring are not implemented.
 
 Any failed assumption returns the migration to the relevant preflight gate; it
 is not a reason to improvise a production workaround during cutover.
