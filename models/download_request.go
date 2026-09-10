@@ -96,6 +96,7 @@ type PlaylistRequest struct {
 	ID         string `json:"id" bson:"_id"`
 	CreatorID  int64  `json:"creator_id" bson:"creator_id"`
 	SpotifyURL string `json:"spotify_url" bson:"spotify_url"`
+	Name       string `json:"name,omitempty" bson:"name,omitempty"`
 
 	Active     bool `json:"active" bson:"active"`
 	Errored    bool `json:"errored" bson:"errored"`
