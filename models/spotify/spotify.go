@@ -61,6 +61,24 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("Spotify API status %d: %s", e.StatusCode, e.Message)
 }
 
+type rateLimitTransport struct {
+	base http.RoundTripper
+}
+
+func (t rateLimitTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+
+	response, err := base.RoundTrip(request)
+	if err != nil || response == nil || response.StatusCode != http.StatusTooManyRequests {
+		return response, err
+	}
+
+	return nil, apiErrorFromResponse(response)
+}
+
 type SpotifyService interface {
 	GetObjectName(ctx context.Context, url string) (string, error)
 	GetObjectType(ctx context.Context, url string) (SpotifyObjectType, error)
@@ -105,6 +123,11 @@ func NewSpotifyServiceWithRefreshToken(ctx context.Context, clientID, clientSecr
 		}
 		httpClient = spotifyConfig.Client(ctx)
 	}
+	baseTransport := httpClient.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	httpClient.Transport = rateLimitTransport{base: baseTransport}
 	spotifyClient := spotify.New(httpClient)
 
 	return &spotifyService{

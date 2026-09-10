@@ -10,12 +10,23 @@ import (
 	"time"
 
 	spotifyapi "github.com/zmb3/spotify/v2"
+	"go.uber.org/zap"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return fn(request)
+}
+
+type trackingReadCloser struct {
+	io.Reader
+	closed bool
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.closed = true
+	return nil
 }
 
 func TestMetadataFromFullTrackPreservesCanonicalIdentity(t *testing.T) {
@@ -169,6 +180,93 @@ func TestGetPlaylistTracksPreservesQuotaClassification(t *testing.T) {
 	}
 	if apiError.Reason != "QUOTA_EXCEEDED" || apiError.RetryAfter != 17*time.Second {
 		t.Fatalf("API error = %#v, want quota classification and retry delay", apiError)
+	}
+}
+
+func TestSDKRequestPreservesRateLimitClassification(t *testing.T) {
+	body := &trackingReadCloser{
+		Reader: strings.NewReader(`{"error":{"message":"quota exhausted","reason":"QUOTA_EXCEEDED"}}`),
+	}
+	client := &http.Client{Transport: rateLimitTransport{base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/v1/playlists/playlist-id" {
+			t.Fatalf("path = %q, want playlist metadata endpoint", request.URL.Path)
+		}
+		header := make(http.Header)
+		header.Set("Retry-After", "86400")
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       body,
+			Header:     header,
+			Request:    request,
+		}, nil
+	})}}
+	service := &spotifyService{
+		spotifyClient: spotifyapi.New(client),
+		httpClient:    client,
+		log:           zap.NewNop(),
+	}
+
+	_, err := service.GetObjectName(
+		context.Background(),
+		"https://open.spotify.com/playlist/playlist-id",
+	)
+
+	var apiError *APIError
+	if !errors.As(err, &apiError) {
+		t.Fatalf("error = %v, want *APIError through SDK request", err)
+	}
+	if apiError.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", apiError.StatusCode, http.StatusTooManyRequests)
+	}
+	if apiError.Message != "quota exhausted" || apiError.Reason != "QUOTA_EXCEEDED" {
+		t.Fatalf("API error = %#v, want Spotify quota details", apiError)
+	}
+	if apiError.RetryAfter != 24*time.Hour {
+		t.Fatalf("RetryAfter = %s, want 24h", apiError.RetryAfter)
+	}
+	if !body.closed {
+		t.Fatal("429 response body was not closed")
+	}
+}
+
+func TestRateLimitTransportPassesThroughNon429Response(t *testing.T) {
+	body := &trackingReadCloser{Reader: strings.NewReader("temporarily unavailable")}
+	wantResponse := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       body,
+		Header:     make(http.Header),
+	}
+	transport := rateLimitTransport{base: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		wantResponse.Request = request
+		return wantResponse, nil
+	})}
+	request, err := http.NewRequest(http.MethodGet, "https://api.spotify.com/v1/albums/id", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatalf("RoundTrip() error = %v", err)
+	}
+	if response != wantResponse {
+		t.Fatal("RoundTrip() replaced the non-429 response")
+	}
+	if body.closed {
+		t.Fatal("RoundTrip() closed a non-429 response body")
+	}
+	contents, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if string(contents) != "temporarily unavailable" {
+		t.Fatalf("body = %q, want passthrough contents", contents)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if !body.closed {
+		t.Fatal("caller could not close passthrough response body")
 	}
 }
 
