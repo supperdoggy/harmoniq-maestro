@@ -371,7 +371,11 @@ func (d *db) UpdateClaimedRequest(
 
 func (d *db) GetActivePlaylists(ctx context.Context) ([]models.PlaylistRequest, error) {
 	var requests []models.PlaylistRequest
-	cursor, err := d.playlistsCollection().Find(ctx, bson.M{"active": true})
+	cursor, err := d.playlistsCollection().Find(
+		ctx,
+		activePlaylistFilter(time.Now().UTC().Unix()),
+		options.Find().SetSort(playlistSort()),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -383,6 +387,9 @@ func (d *db) GetActivePlaylists(ctx context.Context) ([]models.PlaylistRequest, 
 		}
 
 		requests = append(requests, request)
+	}
+	if err := cursor.Err(); err != nil {
+		return nil, err
 	}
 	return requests, nil
 }
@@ -402,6 +409,24 @@ func (d *db) UpdatePlaylistRequest(ctx context.Context, request models.PlaylistR
 	}
 
 	return nil
+}
+
+func activePlaylistFilter(now int64) bson.M {
+	return bson.M{
+		"active": true,
+		"$or": bson.A{
+			bson.M{"next_attempt_at": bson.M{"$exists": false}},
+			bson.M{"next_attempt_at": nil},
+			bson.M{"next_attempt_at": bson.M{"$lte": now}},
+		},
+	}
+}
+
+func playlistSort() bson.D {
+	return bson.D{
+		{Key: "created_at", Value: 1},
+		{Key: "_id", Value: 1},
+	}
 }
 
 func (d *db) UpdateActiveRequest(ctx context.Context, request models.DownloadQueueRequest) error {
