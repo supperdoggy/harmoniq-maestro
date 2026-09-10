@@ -43,6 +43,28 @@ func TestNewDownloadQueueRequest_StartsPending(t *testing.T) {
 	}
 }
 
+func TestNewPlaylistRequestInitializesTimestamps(t *testing.T) {
+	request := newPlaylistRequest(
+		"playlist-request-1",
+		"https://open.spotify.com/playlist/one",
+		42,
+		true,
+		100,
+	)
+
+	if request.ID != "playlist-request-1" ||
+		request.SpotifyURL != "https://open.spotify.com/playlist/one" ||
+		request.CreatorID != 42 {
+		t.Fatalf("playlist identity fields = %+v", request)
+	}
+	if !request.Active || request.Errored || !request.NoPull {
+		t.Fatalf("playlist flags = active:%v errored:%v no_pull:%v", request.Active, request.Errored, request.NoPull)
+	}
+	if request.CreatedAt != 100 || request.UpdatedAt != 100 {
+		t.Fatalf("timestamps = %d/%d, want 100/100", request.CreatedAt, request.UpdatedAt)
+	}
+}
+
 func TestDeactivateRequestUpdate_CancelsAndRevokesLease(t *testing.T) {
 	got := deactivateRequestUpdate(100)
 	want := bson.M{
