@@ -29,7 +29,8 @@ func (s *service) ProcessPlaylistRequest(ctx context.Context) error {
 	s.log.Info("processing active playlists", zap.Any("playlists", len(playlists)))
 
 	var processingErrors []error
-	for _, playlist := range playlists {
+	for index := range playlists {
+		playlist := &playlists[index]
 		processErr := s.ProcessPlaylist(ctx, playlist)
 		switch {
 		case processErr == nil:
@@ -55,7 +56,7 @@ func (s *service) ProcessPlaylistRequest(ctx context.Context) error {
 			playlist.Active = false
 		}
 
-		if err := s.database.UpdatePlaylistRequest(ctx, playlist); err != nil {
+		if err := s.database.UpdatePlaylistRequest(ctx, *playlist); err != nil {
 			s.log.Error("failed to update playlist", zap.Error(err), zap.Any("playlist", playlist))
 			processingErrors = append(
 				processingErrors,
@@ -68,7 +69,7 @@ func (s *service) ProcessPlaylistRequest(ctx context.Context) error {
 	return errors.Join(processingErrors...)
 }
 
-func (s *service) ProcessPlaylist(ctx context.Context, playlist models.PlaylistRequest) error {
+func (s *service) ProcessPlaylist(ctx context.Context, playlist *models.PlaylistRequest) error {
 	s.log.Info("processing playlist", zap.Any("playlist", playlist))
 
 	// checking if playlist is ready to be processed
@@ -84,10 +85,14 @@ func (s *service) ProcessPlaylist(ctx context.Context, playlist models.PlaylistR
 		return ErrMissingFiles
 	}
 
-	playlistName, err := s.spotifyService.GetObjectName(ctx, playlist.SpotifyURL)
-	if err != nil {
-		s.log.Error("failed to get playlist name", zap.Error(err))
-		return err
+	playlistName := strings.TrimSpace(playlist.Name)
+	if playlistName == "" {
+		playlistName, err = s.spotifyService.GetObjectName(ctx, playlist.SpotifyURL)
+		if err != nil {
+			s.log.Error("failed to get playlist name", zap.Error(err))
+			return err
+		}
+		playlist.Name = playlistName
 	}
 
 	songList, err := s.spotifyService.GetPlaylistTracks(ctx, playlist.SpotifyURL)

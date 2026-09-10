@@ -131,12 +131,15 @@ func (f *playlistDatabaseFake) NewDownloadRequest(
 }
 
 type playlistSpotifyFake struct {
-	name   string
-	tracks []spotifyapi.PlaylistItem
+	name      string
+	nameErr   error
+	tracks    []spotifyapi.PlaylistItem
+	nameCalls int
 }
 
 func (f *playlistSpotifyFake) GetObjectName(context.Context, string) (string, error) {
-	return f.name, nil
+	f.nameCalls++
+	return f.name, f.nameErr
 }
 
 func (f *playlistSpotifyFake) GetObjectType(
@@ -177,7 +180,7 @@ func TestProcessPlaylistQueuesAllTracksWhenCatalogIsEmpty(t *testing.T) {
 		playlistsOutputPath: filepath.Join(t.TempDir(), "playlists"),
 	}
 
-	err := srv.ProcessPlaylist(context.Background(), models.PlaylistRequest{
+	err := srv.ProcessPlaylist(context.Background(), &models.PlaylistRequest{
 		SpotifyURL: "https://open.spotify.com/playlist/playlist-id",
 	})
 	if !errors.Is(err, ErrMissingFiles) {
@@ -219,7 +222,7 @@ func TestProcessPlaylistNoPullWritesSanitizedEmptyPlaylist(t *testing.T) {
 		playlistsOutputPath: playlistsOutputPath,
 	}
 
-	err := srv.ProcessPlaylist(context.Background(), models.PlaylistRequest{
+	err := srv.ProcessPlaylist(context.Background(), &models.PlaylistRequest{
 		SpotifyURL: "https://open.spotify.com/playlist/playlist-id",
 		NoPull:     true,
 	})
@@ -258,7 +261,7 @@ func TestProcessPlaylistWaitsWhenMissingTrackIsAlreadyQueued(t *testing.T) {
 		playlistsOutputPath: playlistsOutputPath,
 	}
 
-	err := srv.ProcessPlaylist(context.Background(), models.PlaylistRequest{
+	err := srv.ProcessPlaylist(context.Background(), &models.PlaylistRequest{
 		SpotifyURL: "https://open.spotify.com/playlist/playlist-id",
 	})
 	if !errors.Is(err, ErrMissingFiles) {
@@ -304,6 +307,34 @@ func TestProcessPlaylistRequestDoesNotConsumeRetriesWhileWaiting(t *testing.T) {
 		database.updatedPlaylist.Errored ||
 		database.updatedPlaylist.RetryCount != 4 {
 		t.Fatalf("waiting playlist state = %#v", *database.updatedPlaylist)
+	}
+}
+
+func TestProcessPlaylistUsesCachedName(t *testing.T) {
+	base := t.TempDir()
+	database := &playlistDatabaseFake{}
+	spotifyService := &playlistSpotifyFake{nameErr: errors.New("name lookup must not run")}
+	srv := &service{
+		database:            database,
+		spotifyService:      spotifyService,
+		log:                 zap.NewNop(),
+		libraryPath:         filepath.Join(base, "music"),
+		playlistsOutputPath: filepath.Join(base, "playlists"),
+	}
+	playlist := &models.PlaylistRequest{
+		SpotifyURL: "https://open.spotify.com/playlist/playlist-id",
+		Name:       "Cached Focus",
+		NoPull:     true,
+	}
+
+	if err := srv.ProcessPlaylist(context.Background(), playlist); err != nil {
+		t.Fatalf("ProcessPlaylist() error = %v", err)
+	}
+	if spotifyService.nameCalls != 0 {
+		t.Fatalf("cached playlist caused %d Spotify name calls", spotifyService.nameCalls)
+	}
+	if _, err := os.Stat(filepath.Join(base, "playlists", "Cached Focus.m3u")); err != nil {
+		t.Fatalf("cached-name playlist was not created: %v", err)
 	}
 }
 
