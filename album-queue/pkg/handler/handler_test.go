@@ -29,6 +29,7 @@ type fakeDatabase struct {
 	unresolvedTracks []db.FailedTrack
 	activeByURL      map[string]bool
 	activeRequests   []models.DownloadQueueRequest
+	activePlaylists  []models.PlaylistRequest
 	musicFiles       []models.MusicFile
 
 	newRequestErr   error
@@ -36,6 +37,16 @@ type fakeDatabase struct {
 	updatedRequests []models.DownloadQueueRequest
 	deactivatedIDs  []string
 	deactivateErr   error
+}
+
+type queueSpotifyService struct {
+	spotify.SpotifyService
+	objectNameCalls int
+}
+
+func (s *queueSpotifyService) GetObjectName(context.Context, string) (string, error) {
+	s.objectNameCalls++
+	return "live Spotify name", nil
 }
 
 func (f *fakeDatabase) NewDownloadRequest(_ context.Context, url, name string, creatorID int64, objectType spotify.SpotifyObjectType, expectedTrackCount int, trackMetadata []spotify.TrackMetadata) error {
@@ -82,7 +93,7 @@ func (f *fakeDatabase) NewPlaylistRequest(context.Context, string, int64, bool) 
 }
 
 func (f *fakeDatabase) GetActivePlaylists(context.Context) ([]models.PlaylistRequest, error) {
-	return nil, nil
+	return append([]models.PlaylistRequest(nil), f.activePlaylists...), nil
 }
 
 func (f *fakeDatabase) FindMusicFiles(context.Context, []string, []string) ([]models.MusicFile, error) {
@@ -212,6 +223,74 @@ func TestHandleQueue_RendersProgressWithoutMutatingWorkerJob(t *testing.T) {
 	}
 	if len(sinks.replies) != 1 || !strings.Contains(sinks.replies[0], "1/1 (100%)") {
 		t.Fatalf("queue did not render refreshed local progress: %#v", sinks.replies)
+	}
+}
+
+func TestHandleQueueUsesPersistedPlaylistStatusWithoutSpotifyLookup(t *testing.T) {
+	nextAttemptAt := time.Now().UTC().Add(2 * time.Hour).Unix()
+	database := &fakeDatabase{
+		activeByURL: map[string]bool{},
+		activePlaylists: []models.PlaylistRequest{
+			{
+				ID:            "playlist-1",
+				SpotifyURL:    "https://open.spotify.com/playlist/cached",
+				Name:          "Cached playlist name",
+				Active:        true,
+				Errored:       true,
+				RetryCount:    2,
+				NextAttemptAt: nextAttemptAt,
+				LastError: &models.DownloadRequestError{
+					Code:    "spotify_rate_limited",
+					Message: "sensitive upstream detail must not be rendered",
+				},
+			},
+			{
+				ID:            "playlist-2",
+				SpotifyURL:    "https://open.spotify.com/playlist/fallback",
+				Name:          "  ",
+				Active:        true,
+				Errored:       true,
+				RetryCount:    1,
+				NextAttemptAt: 1,
+				LastError: &models.DownloadRequestError{
+					Code: "unsafe\ncode",
+				},
+			},
+		},
+	}
+	sinks := &testSinks{}
+	spotifyService := &queueSpotifyService{}
+	h := createTestHandler(database, sinks)
+	h.spotifyService = spotifyService
+
+	h.HandleQueue(testMessage("/queue"))
+
+	if spotifyService.objectNameCalls != 0 {
+		t.Fatalf("queue rendering made %d Spotify name lookups", spotifyService.objectNameCalls)
+	}
+	if len(sinks.replies) != 1 {
+		t.Fatalf("queue replies = %d, want 1", len(sinks.replies))
+	}
+	reply := sinks.replies[0]
+	for _, expected := range []string{
+		"Cached playlist name",
+		"https://open.spotify.com/playlist/fallback",
+		"spotify_rate_limited",
+		time.Unix(nextAttemptAt, 0).UTC().Format(time.RFC3339),
+	} {
+		if !strings.Contains(reply, expected) {
+			t.Errorf("queue reply does not contain %q: %q", expected, reply)
+		}
+	}
+	for _, unexpected := range []string{
+		"live Spotify name",
+		"sensitive upstream detail",
+		"unsafe\ncode",
+		time.Unix(1, 0).UTC().Format(time.RFC3339),
+	} {
+		if strings.Contains(reply, unexpected) {
+			t.Errorf("queue reply unexpectedly contains %q: %q", unexpected, reply)
+		}
 	}
 }
 
