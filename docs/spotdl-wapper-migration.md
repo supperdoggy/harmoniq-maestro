@@ -83,13 +83,18 @@ without changing queue state or the final-library contract.
 The original staged proposal is substantially implemented. This table is the
 current migration ledger.
 
+The repository also contains a post-Stage-A playlist retry enhancement. Its
+presence in this implementation ledger does not mean it is deployed on the
+`music-services` VM; the production evidence document remains authoritative
+for the live image and schema.
+
 | Capability | Status | Notes |
 | --- | --- | --- |
 | Secret-safe startup logging | Implemented | Only an explicit non-secret allowlist is logged |
 | Long-running worker and graceful shutdown | Implemented | Immediate drain plus configurable polling; command cancellation propagates |
 | Current Spotify playlist endpoint | Implemented | Uses `/playlists/{id}/items` and current `item` shape |
 | Spotify user refresh token | Implemented | Operator must obtain the token outside this repository |
-| Spotify `429` classification | Implemented | Status is normalized across API paths; the direct items endpoint can also extend delay from `Retry-After`, while SDK errors do not expose it |
+| Spotify `429` classification | Implemented locally | The shared transport preserves seconds or HTTP-date `Retry-After` for SDK-backed and direct paths; retry scheduling uses it only when longer than the configured floor |
 | Media/playlist path split | Implemented | `MEDIA_OUTPUT_TEMPLATE` and `PLAYLISTS_OUTPUT_PATH`; `DESTINATION` is deprecated |
 | Provider-neutral contract | Implemented | `Resolve` and `Acquire` return candidates/results |
 | Per-track workflow | Implemented | Albums and playlists no longer use bulk spotDL |
@@ -100,6 +105,8 @@ current migration ledger.
 | Atomic queue claim and lease | Implemented | Random per-claim fence, heartbeat, and stale-attempt write protection |
 | Explicit durable download states | Implemented | Dual-written with legacy `active`/`errored` flags |
 | Typed failures and scheduled retries | Implemented | Acquisition-pipeline failures share one request-wide budget; published-artifact catalog finalization backs off without consuming it |
+| Scheduled one-off playlist retries | Implemented locally | Optional `name`, `next_attempt_at`, and typed `last_error`; missing/null schedules preserve legacy eligibility; four scheduled retries precede terminal failure on attempt five |
+| Cached one-off playlist names | Implemented locally | The worker persists a successful name read and `/queue` falls back to the URL instead of issuing another Spotify metadata request |
 | Synchronous validation and catalog import | Implemented | Provider checksum verification, deterministic FFmpeg tags/artwork, FFprobe duration check, bounded paths, `0640` output, synced hard-link publication, recovery journal/resume, collision handling, and upsert |
 | Private staging attempts and cleanup | Implemented | New attempts use non-hidden `harmoniq-attempt-*` directories because spotDL rewrites dot-prefixed path components; the marker, direct-child containment, and no-symlink checks remain authoritative, and legacy marked `.harmoniq-attempt-*` directories remain supported during migration |
 | Removal of indexer completion gate | Implemented | Active worker paths do not use `index-status` |
@@ -113,6 +120,12 @@ current migration ledger.
 | Matching quality telemetry | Not implemented | Logs exist; metrics and curated-corpus reporting do not |
 | Single playlist owner | Not implemented | One-off and subscribed/dynamic flows remain split |
 | External/owned-file importer | Not implemented | Synchronous import covers provider-created assets only |
+
+The local one-off playlist query selects `active=true` rows whose
+`next_attempt_at` is missing, null, or due, then orders them by `created_at` and
+`_id`. Its non-sparse, non-unique `playlist_retry_eligibility_v1` index is
+`{active: 1, next_attempt_at: 1, created_at: 1, _id: 1}`. This preserves
+immediate eligibility for legacy rows without requiring a backfill.
 
 ## Implemented provider contract
 
@@ -312,6 +325,13 @@ catalog upsert errors, and orphan-file recovery. Add a worker readiness signal
 that verifies MongoDB and configured executable availability without
 downloading content.
 
+Report one-off playlists as due, deferred, missing-file wait, and terminal
+rather than one undifferentiated active count. Alert when a due playlist
+remains unprocessed for more than the expected poll tolerance and track
+`last_error.code=spotify_rate_limited` separately. A future
+`next_attempt_at` is intentional backoff, not evidence that restarting the
+worker will make progress.
+
 Alert specifically on repeated recovery-journal finalization failures. Those
 retries intentionally preserve `WORKER_MAX_ATTEMPTS`, so the worker will not
 turn a valid published artifact into `failed` merely because catalog
@@ -328,11 +348,14 @@ already have bounded cleanup.
 
 Move one-off and subscribed/dynamic playlists behind one materialization
 contract, or give each clearly disjoint ownership. The one-off queue should
-gain claims/leases and should wait on the exact missing track jobs. Missing
-files now wait without consuming retry count or writing a partial
-non-`no_pull` M3U, but a suppressed/review/successful dependency with no usable
-catalog file can still leave the playlist active forever. Ensure playlist work
-also receives fair scheduling when downloads are continuously available.
+gain claims/leases and should wait on the exact missing track jobs. It now has
+durable retry due times, typed errors, a fixed five-attempt failure budget, and
+a cached display name, but those additions do not provide exclusive ownership.
+Missing files wait without consuming retry count or writing a partial
+non-`no_pull` M3U, while a suppressed/review/successful dependency with no
+usable catalog file can still leave the playlist active forever. Ensure
+playlist work also receives fair scheduling when downloads are continuously
+available.
 
 ## Rollout plan
 
@@ -348,6 +371,11 @@ Stage A was deployed to `music-services` on 2026-08-03 from source revision
 spotDL remains the primary backend and is invoked by the coordinator inside
 that container. See the production-state document for the complete as-built
 manifest, evidence, and residual risks.
+
+The additive playlist name/retry fields, retry-eligibility index, and cached
+`/queue` rendering described in this document were implemented after revision
+`66249d8`. They require a separately built, reviewed, and verified deployment;
+this document does not record that upgrade as having occurred.
 
 The first track canary exposed four deployment-contract issues before the
 final image was accepted: spotDL needed writable private temp state; yt-dlp
@@ -528,10 +556,15 @@ Before making a replacement provider primary, test:
 - termination after claim, during resolve/download/tag/probe, after publish
   before the recovery journal, after the journal, after catalog upsert, and
   after per-track progress;
-- scheduled retry, direct-endpoint Spotify `Retry-After`, SDK status
-  normalization, acquisition-attempt exhaustion, budget-preserving
-  recovery-journal finalization retries, review, cancel, approve, and explicit
-  provider re-route;
+- scheduled download retry, seconds and HTTP-date Spotify `Retry-After` on both
+  SDK-backed and direct HTTP calls, SDK status normalization,
+  acquisition-attempt exhaustion, budget-preserving recovery-journal
+  finalization retries, review, cancel, approve, and explicit provider
+  re-route;
+- one-off playlist 429 handling at both the name and items stages, configured
+  retry-floor precedence, fixed five-attempt exhaustion, due-time filtering,
+  deterministic ordering, legacy rows without schedules, persistence across
+  restart, and clearing stale retry state on success or missing-file wait;
 - unavailable and region-restricted tracks;
 - explicit/clean, live/studio, remix/original, remaster, acoustic,
   instrumental, cover/karaoke, slowed/sped-up/nightcore, and radio/full edit
@@ -547,6 +580,8 @@ Before making a replacement provider primary, test:
   attempt handling, refusal to adopt unmarked sanitized siblings, discard,
   orphan-attempt cleanup, and idempotent reprocessing;
 - complete, `no_pull` partial, empty, missing-file wait, and replacement M3Us;
+- `/queue` rendering from a cached playlist name, with URL fallback and no
+  additional Spotify metadata call;
 - container startup checks and a real MongoDB/tool end-to-end path.
 
 Success means a correct, auditable library artifact—not merely a zero
