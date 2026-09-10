@@ -371,7 +371,11 @@ func (d *db) UpdateClaimedRequest(
 
 func (d *db) GetActivePlaylists(ctx context.Context) ([]models.PlaylistRequest, error) {
 	var requests []models.PlaylistRequest
-	cursor, err := d.playlistsCollection().Find(ctx, bson.M{"active": true})
+	cursor, err := d.playlistsCollection().Find(
+		ctx,
+		activePlaylistFilter(time.Now().UTC().Unix()),
+		options.Find().SetSort(playlistSort()),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -384,15 +388,18 @@ func (d *db) GetActivePlaylists(ctx context.Context) ([]models.PlaylistRequest, 
 
 		requests = append(requests, request)
 	}
+	if err := cursor.Err(); err != nil {
+		return nil, err
+	}
 	return requests, nil
 }
 
 func (d *db) UpdatePlaylistRequest(ctx context.Context, request models.PlaylistRequest) error {
-	info, err := d.playlistsCollection().UpdateOne(ctx, bson.M{"_id": request.ID}, bson.M{"$set": bson.M{
-		"active":      request.Active,
-		"errored":     request.Errored,
-		"retry_count": request.RetryCount,
-	}})
+	info, err := d.playlistsCollection().UpdateOne(
+		ctx,
+		bson.M{"_id": request.ID},
+		playlistRequestUpdate(request, time.Now().UTC().Unix()),
+	)
 	if err != nil {
 		return err
 	}
@@ -402,6 +409,56 @@ func (d *db) UpdatePlaylistRequest(ctx context.Context, request models.PlaylistR
 	}
 
 	return nil
+}
+
+func activePlaylistFilter(now int64) bson.M {
+	return bson.M{
+		"active": true,
+		"$or": bson.A{
+			bson.M{"next_attempt_at": bson.M{"$exists": false}},
+			bson.M{"next_attempt_at": nil},
+			bson.M{"next_attempt_at": bson.M{"$lte": now}},
+		},
+	}
+}
+
+func playlistSort() bson.D {
+	return bson.D{
+		{Key: "created_at", Value: 1},
+		{Key: "_id", Value: 1},
+	}
+}
+
+func playlistRequestUpdate(request models.PlaylistRequest, now int64) bson.M {
+	set := bson.M{
+		"active":      request.Active,
+		"errored":     request.Errored,
+		"retry_count": request.RetryCount,
+		"updated_at":  now,
+	}
+	unset := bson.M{}
+
+	if request.Name != "" {
+		set["name"] = request.Name
+	} else {
+		unset["name"] = ""
+	}
+	if request.NextAttemptAt > 0 {
+		set["next_attempt_at"] = request.NextAttemptAt
+	} else {
+		unset["next_attempt_at"] = ""
+	}
+	if request.LastError != nil {
+		set["last_error"] = request.LastError
+	} else {
+		unset["last_error"] = ""
+	}
+
+	update := bson.M{"$set": set}
+	if len(unset) > 0 {
+		update["$unset"] = unset
+	}
+	return update
 }
 
 func (d *db) UpdateActiveRequest(ctx context.Context, request models.DownloadQueueRequest) error {
@@ -744,6 +801,11 @@ func (d *db) EnsureIndexes(ctx context.Context) error {
 		indexErrors = append(indexErrors, fmt.Errorf("create queue claim index: %w", err))
 	}
 
+	_, err = database.Collection("playlist-requests").Indexes().CreateOne(ctx, playlistRetryIndex())
+	if err != nil {
+		indexErrors = append(indexErrors, fmt.Errorf("create playlist retry index: %w", err))
+	}
+
 	musicIndexes := []mongo.IndexModel{
 		{
 			Keys: bson.D{{Key: "spotify_id", Value: 1}},
@@ -764,6 +826,18 @@ func (d *db) EnsureIndexes(ctx context.Context) error {
 	}
 
 	return errors.Join(indexErrors...)
+}
+
+func playlistRetryIndex() mongo.IndexModel {
+	return mongo.IndexModel{
+		Keys: bson.D{
+			{Key: "active", Value: 1},
+			{Key: "next_attempt_at", Value: 1},
+			{Key: "created_at", Value: 1},
+			{Key: "_id", Value: 1},
+		},
+		Options: options.Index().SetName("playlist_retry_eligibility_v1"),
+	}
 }
 
 // escapeRegex escapes special regex characters in a string
