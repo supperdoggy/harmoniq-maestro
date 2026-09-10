@@ -144,14 +144,8 @@ func newDownloadQueueRequest(
 
 func (d *db) NewPlaylistRequest(ctx context.Context, url string, creatorID int64, noPull bool) error {
 	id := uuid.NewV4()
-	request := models.PlaylistRequest{
-		SpotifyURL: url,
-		Active:     true,
-		ID:         id.String(),
-		CreatedAt:  time.Now().Unix(),
-		CreatorID:  creatorID,
-		NoPull:     noPull,
-	}
+	now := time.Now().Unix()
+	request := newPlaylistRequest(id.String(), url, creatorID, noPull, now)
 
 	_, err := d.playlistRequestCollection.InsertOne(ctx, request)
 	if err != nil {
@@ -159,6 +153,18 @@ func (d *db) NewPlaylistRequest(ctx context.Context, url string, creatorID int64
 	}
 
 	return nil
+}
+
+func newPlaylistRequest(id, url string, creatorID int64, noPull bool, now int64) models.PlaylistRequest {
+	return models.PlaylistRequest{
+		ID:         id,
+		CreatorID:  creatorID,
+		SpotifyURL: url,
+		Active:     true,
+		NoPull:     noPull,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
 }
 
 func (d *db) GetActiveRequests(ctx context.Context) ([]models.DownloadQueueRequest, error) {
