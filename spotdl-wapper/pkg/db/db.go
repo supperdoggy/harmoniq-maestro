@@ -395,11 +395,11 @@ func (d *db) GetActivePlaylists(ctx context.Context) ([]models.PlaylistRequest, 
 }
 
 func (d *db) UpdatePlaylistRequest(ctx context.Context, request models.PlaylistRequest) error {
-	info, err := d.playlistsCollection().UpdateOne(ctx, bson.M{"_id": request.ID}, bson.M{"$set": bson.M{
-		"active":      request.Active,
-		"errored":     request.Errored,
-		"retry_count": request.RetryCount,
-	}})
+	info, err := d.playlistsCollection().UpdateOne(
+		ctx,
+		bson.M{"_id": request.ID},
+		playlistRequestUpdate(request, time.Now().UTC().Unix()),
+	)
 	if err != nil {
 		return err
 	}
@@ -427,6 +427,38 @@ func playlistSort() bson.D {
 		{Key: "created_at", Value: 1},
 		{Key: "_id", Value: 1},
 	}
+}
+
+func playlistRequestUpdate(request models.PlaylistRequest, now int64) bson.M {
+	set := bson.M{
+		"active":      request.Active,
+		"errored":     request.Errored,
+		"retry_count": request.RetryCount,
+		"updated_at":  now,
+	}
+	unset := bson.M{}
+
+	if request.Name != "" {
+		set["name"] = request.Name
+	} else {
+		unset["name"] = ""
+	}
+	if request.NextAttemptAt > 0 {
+		set["next_attempt_at"] = request.NextAttemptAt
+	} else {
+		unset["next_attempt_at"] = ""
+	}
+	if request.LastError != nil {
+		set["last_error"] = request.LastError
+	} else {
+		unset["last_error"] = ""
+	}
+
+	update := bson.M{"$set": set}
+	if len(unset) > 0 {
+		update["$unset"] = unset
+	}
+	return update
 }
 
 func (d *db) UpdateActiveRequest(ctx context.Context, request models.DownloadQueueRequest) error {
