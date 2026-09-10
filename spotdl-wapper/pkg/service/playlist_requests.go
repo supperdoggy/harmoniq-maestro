@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/supperdoggy/SmartHomeServer/harmoniq-maestro/spotdl-wapper/pkg/utils"
 	models "github.com/supperdoggy/spot-models"
@@ -18,6 +21,8 @@ import (
 var (
 	ErrMissingFiles = errors.New("missing files")
 )
+
+const maxPlaylistAttempts = 5
 
 func (s *service) ProcessPlaylistRequest(ctx context.Context) error {
 	playlists, err := s.database.GetActivePlaylists(ctx)
@@ -36,26 +41,26 @@ func (s *service) ProcessPlaylistRequest(ctx context.Context) error {
 		case processErr == nil:
 			playlist.Active = false
 			playlist.Errored = false
+			playlist.NextAttemptAt = 0
+			playlist.LastError = nil
 		case errors.Is(processErr, ErrMissingFiles):
 			// Waiting for already-queued downloads is expected coordination,
 			// not a failed playlist attempt.
 			playlist.Active = true
 			playlist.Errored = false
+			playlist.NextAttemptAt = 0
+			playlist.LastError = nil
 			s.log.Info("playlist is waiting for missing tracks", zap.String("playlist_id", playlist.ID))
 		default:
 			s.log.Error("failed to process playlist", zap.Error(processErr), zap.Any("playlist", playlist))
-			playlist.Errored = true
-			playlist.RetryCount++
+			s.applyPlaylistFailure(playlist, processErr)
 			processingErrors = append(
 				processingErrors,
 				fmt.Errorf("process playlist %s: %w", playlist.ID, processErr),
 			)
 		}
 
-		if processErr != nil && !errors.Is(processErr, ErrMissingFiles) && playlist.RetryCount >= 5 {
-			playlist.Active = false
-		}
-
+		playlist.UpdatedAt = time.Now().UTC().Unix()
 		if err := s.database.UpdatePlaylistRequest(ctx, *playlist); err != nil {
 			s.log.Error("failed to update playlist", zap.Error(err), zap.Any("playlist", playlist))
 			processingErrors = append(
@@ -67,6 +72,68 @@ func (s *service) ProcessPlaylistRequest(ctx context.Context) error {
 
 	s.log.Info("completed processing of active playlists")
 	return errors.Join(processingErrors...)
+}
+
+func (s *service) applyPlaylistFailure(playlist *models.PlaylistRequest, processErr error) {
+	now := time.Now().UTC()
+	retryDelay := s.retryDelay
+	if retryDelay <= 0 {
+		retryDelay = defaultRetryDelay
+	}
+
+	code := "playlist_processing"
+	details := map[string]string{}
+	var apiError *spotify.APIError
+	if errors.As(processErr, &apiError) && apiError.StatusCode == http.StatusTooManyRequests {
+		code = "spotify_rate_limited"
+		if apiError.RetryAfter > retryDelay {
+			retryDelay = apiError.RetryAfter
+		}
+		details["status_code"] = strconv.Itoa(apiError.StatusCode)
+		if reason := strings.TrimSpace(apiError.Reason); reason != "" {
+			details["reason"] = reason
+		}
+		if apiError.RetryAfter > 0 {
+			details["retry_after_seconds"] = strconv.FormatInt(int64(apiError.RetryAfter/time.Second), 10)
+		}
+	}
+	if len(details) == 0 {
+		details = nil
+	}
+
+	playlist.Errored = true
+	playlist.RetryCount++
+	playlist.LastError = &models.DownloadRequestError{
+		Code:       code,
+		Stage:      "playlist",
+		Message:    processErr.Error(),
+		Retryable:  true,
+		OccurredAt: now.Unix(),
+		Details:    details,
+	}
+
+	if playlist.RetryCount >= maxPlaylistAttempts {
+		playlist.Active = false
+		playlist.NextAttemptAt = 0
+		s.log.Error(
+			"playlist retry budget exhausted",
+			zap.String("playlist_id", playlist.ID),
+			zap.String("error_code", code),
+			zap.Int("retry_count", playlist.RetryCount),
+		)
+		return
+	}
+
+	playlist.Active = true
+	playlist.NextAttemptAt = now.Add(retryDelay).Unix()
+	s.log.Warn(
+		"playlist retry scheduled",
+		zap.String("playlist_id", playlist.ID),
+		zap.String("error_code", code),
+		zap.Int("retry_count", playlist.RetryCount),
+		zap.Duration("retry_after", retryDelay),
+		zap.Int64("next_attempt_at", playlist.NextAttemptAt),
+	)
 }
 
 func (s *service) ProcessPlaylist(ctx context.Context, playlist *models.PlaylistRequest) error {
