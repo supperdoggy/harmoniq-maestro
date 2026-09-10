@@ -37,6 +37,17 @@ func (s *service) ProcessPlaylistRequest(ctx context.Context) error {
 	for index := range playlists {
 		playlist := &playlists[index]
 		processErr := s.ProcessPlaylist(ctx, playlist)
+		if processErr != nil && ctx.Err() != nil &&
+			(errors.Is(processErr, context.Canceled) || errors.Is(processErr, context.DeadlineExceeded)) {
+			// A shutdown must not consume the playlist's finite retry budget. The
+			// still-active row remains immediately eligible after the next start.
+			processingErrors = append(
+				processingErrors,
+				fmt.Errorf("process playlist %s: %w", playlist.ID, processErr),
+			)
+			break
+		}
+
 		switch {
 		case processErr == nil:
 			playlist.Active = false

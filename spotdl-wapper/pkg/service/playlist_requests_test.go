@@ -537,6 +537,36 @@ func TestProcessPlaylistRequestSuccessClearsRetryMetadata(t *testing.T) {
 	}
 }
 
+func TestProcessPlaylistRequestCancellationDoesNotConsumeAttempt(t *testing.T) {
+	base := t.TempDir()
+	database := &playlistDatabaseFake{activePlaylists: []models.PlaylistRequest{{
+		ID:         "playlist-request-1",
+		SpotifyURL: "https://open.spotify.com/playlist/playlist-id",
+		Active:     true,
+		RetryCount: 2,
+	}}}
+	srv := &service{
+		database: database,
+		spotifyService: &playlistSpotifyFake{
+			nameErr: fmt.Errorf("stopping: %w", context.Canceled),
+		},
+		log:                 zap.NewNop(),
+		retryDelay:          time.Minute,
+		libraryPath:         filepath.Join(base, "music"),
+		playlistsOutputPath: filepath.Join(base, "playlists"),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := srv.ProcessPlaylistRequest(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ProcessPlaylistRequest() error = %v, want context cancellation", err)
+	}
+	if database.updatedPlaylist != nil {
+		t.Fatalf("cancellation persisted retry state: %#v", *database.updatedPlaylist)
+	}
+}
+
 func newPlaylistItem(
 	id string,
 	title string,
