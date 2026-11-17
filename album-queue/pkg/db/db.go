@@ -51,7 +51,7 @@ type FailedTrack struct {
 	Title          string `json:"title"`
 	FailedAttempts int    `json:"failed_attempts"`
 	SourceCount    int    `json:"source_count"`
-	LastSeenAt     int64  `json:"last_seen_at"`
+	CreatedAt      int64  `json:"created_at"`
 }
 
 type FailedTracksPage struct {
@@ -605,9 +605,9 @@ func collectUnresolvedFailedTracks(requests []models.DownloadQueueRequest) []Fai
 	failedByURL := make(map[string]FailedTrack)
 
 	for _, request := range requests {
-		lastSeen := request.UpdatedAt
-		if lastSeen == 0 {
-			lastSeen = request.CreatedAt
+		createdAt := request.CreatedAt
+		if createdAt == 0 {
+			createdAt = request.UpdatedAt
 		}
 
 		for _, track := range request.TrackMetadata {
@@ -623,7 +623,7 @@ func collectUnresolvedFailedTracks(requests []models.DownloadQueueRequest) []Fai
 					Title:          track.Title,
 					FailedAttempts: track.FailedAttempts,
 					SourceCount:    1,
-					LastSeenAt:     lastSeen,
+					CreatedAt:      createdAt,
 				}
 				continue
 			}
@@ -632,8 +632,8 @@ func collectUnresolvedFailedTracks(requests []models.DownloadQueueRequest) []Fai
 			if track.FailedAttempts > current.FailedAttempts {
 				current.FailedAttempts = track.FailedAttempts
 			}
-			if lastSeen >= current.LastSeenAt {
-				current.LastSeenAt = lastSeen
+			if createdAt >= current.CreatedAt {
+				current.CreatedAt = createdAt
 				current.Artist = track.Artist
 				current.Title = track.Title
 			}
@@ -666,10 +666,10 @@ func filterResolvedFailedTracks(
 	}
 
 	sort.Slice(unresolvedTracks, func(i, j int) bool {
-		if unresolvedTracks[i].LastSeenAt == unresolvedTracks[j].LastSeenAt {
+		if unresolvedTracks[i].CreatedAt == unresolvedTracks[j].CreatedAt {
 			return unresolvedTracks[i].SpotifyURL < unresolvedTracks[j].SpotifyURL
 		}
-		return unresolvedTracks[i].LastSeenAt > unresolvedTracks[j].LastSeenAt
+		return unresolvedTracks[i].CreatedAt < unresolvedTracks[j].CreatedAt
 	})
 
 	return unresolvedTracks

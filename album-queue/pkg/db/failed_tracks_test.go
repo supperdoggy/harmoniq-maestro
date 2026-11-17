@@ -45,14 +45,16 @@ func TestCollectUnresolvedFailedTracksDedupesByURL(t *testing.T) {
 	requests := []models.DownloadQueueRequest{
 		{
 			ID:        "r1",
-			UpdatedAt: 10,
+			CreatedAt: 10,
+			UpdatedAt: 100,
 			TrackMetadata: []spotify.TrackMetadata{
 				{SpotifyURL: url, Artist: "a1", Title: "x1", Found: false, FailedAttempts: 3},
 			},
 		},
 		{
 			ID:        "r2",
-			UpdatedAt: 20,
+			CreatedAt: 20,
+			UpdatedAt: 50,
 			TrackMetadata: []spotify.TrackMetadata{
 				{SpotifyURL: url, Artist: "a2", Title: "x2", Found: false, FailedAttempts: 5},
 			},
@@ -69,26 +71,26 @@ func TestCollectUnresolvedFailedTracksDedupesByURL(t *testing.T) {
 	if tracks[0].FailedAttempts != 5 {
 		t.Fatalf("expected max failed_attempts=5, got %d", tracks[0].FailedAttempts)
 	}
-	if tracks[0].LastSeenAt != 20 {
-		t.Fatalf("expected last_seen_at=20, got %d", tracks[0].LastSeenAt)
+	if tracks[0].CreatedAt != 20 {
+		t.Fatalf("expected created_at=20, got %d", tracks[0].CreatedAt)
 	}
 	if tracks[0].Artist != "a2" || tracks[0].Title != "x2" {
 		t.Fatalf("expected latest artist/title from most recent request, got %+v", tracks[0])
 	}
 }
 
-func TestFilterResolvedFailedTracksSortsNewestFirst(t *testing.T) {
+func TestFilterResolvedFailedTracksSortsOldestRequestFirst(t *testing.T) {
 	tracks := filterResolvedFailedTracks(
 		[]FailedTrack{
-			{SpotifyURL: "https://open.spotify.com/track/older", LastSeenAt: 10},
-			{SpotifyURL: "https://open.spotify.com/track/newer", LastSeenAt: 20},
+			{SpotifyURL: "https://open.spotify.com/track/newer", CreatedAt: 20},
+			{SpotifyURL: "https://open.spotify.com/track/older", CreatedAt: 10},
 		},
 		map[string]struct{}{},
 		map[string]struct{}{},
 	)
 
-	if len(tracks) != 2 || tracks[0].LastSeenAt != 20 || tracks[1].LastSeenAt != 10 {
-		t.Fatalf("tracks are not sorted newest first: %+v", tracks)
+	if len(tracks) != 2 || tracks[0].CreatedAt != 10 || tracks[1].CreatedAt != 20 {
+		t.Fatalf("tracks are not sorted oldest request first: %+v", tracks)
 	}
 }
 
