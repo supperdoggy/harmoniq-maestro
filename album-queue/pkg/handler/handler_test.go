@@ -226,6 +226,96 @@ func TestHandleQueue_RendersProgressWithoutMutatingWorkerJob(t *testing.T) {
 	}
 }
 
+func TestQueueVisibleRequestsFiltersNonRunnableStates(t *testing.T) {
+	tests := []struct {
+		name    string
+		active  bool
+		state   models.DownloadRequestState
+		visible bool
+	}{
+		{name: "legacy pending", active: true, state: "", visible: true},
+		{name: "pending", active: true, state: models.DownloadRequestStatePending, visible: true},
+		{name: "claimed", active: true, state: models.DownloadRequestStateClaimed, visible: true},
+		{name: "resolving", active: true, state: models.DownloadRequestStateResolving, visible: true},
+		{name: "downloading", active: true, state: models.DownloadRequestStateDownloading, visible: true},
+		{name: "validating", active: true, state: models.DownloadRequestStateValidating, visible: true},
+		{name: "imported", active: true, state: models.DownloadRequestStateImported, visible: true},
+		{name: "retry wait", active: true, state: models.DownloadRequestStateRetryWait, visible: true},
+		{name: "needs review", active: true, state: models.DownloadRequestStateNeedsReview},
+		{name: "completed", active: true, state: models.DownloadRequestStateCompleted},
+		{name: "failed", active: true, state: models.DownloadRequestStateFailed},
+		{name: "cancelled", active: true, state: models.DownloadRequestStateCancelled},
+		{name: "inactive pending", active: false, state: models.DownloadRequestStatePending},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			visible := queueVisibleRequests([]models.DownloadQueueRequest{{
+				ID:     test.name,
+				Active: test.active,
+				State:  test.state,
+			}})
+			if got := len(visible) == 1; got != test.visible {
+				t.Fatalf("visible = %t, want %t", got, test.visible)
+			}
+		})
+	}
+}
+
+func TestHandleQueueHidesNeedsReviewRequests(t *testing.T) {
+	database := &fakeDatabase{
+		activeByURL: map[string]bool{},
+		activeRequests: []models.DownloadQueueRequest{
+			{
+				ID:     "pending",
+				Name:   "Visible pending request",
+				Active: true,
+				State:  models.DownloadRequestStatePending,
+			},
+			{
+				ID:     "review",
+				Name:   "Hidden review request",
+				Active: true,
+				State:  models.DownloadRequestStateNeedsReview,
+			},
+		},
+	}
+	sinks := &testSinks{}
+	h := createTestHandler(database, sinks)
+
+	h.HandleQueue(testMessage("/queue"))
+
+	if len(sinks.replies) != 1 {
+		t.Fatalf("queue replies = %d, want 1", len(sinks.replies))
+	}
+	if !strings.Contains(sinks.replies[0], "Visible pending request") {
+		t.Fatalf("queue reply omitted pending request: %q", sinks.replies[0])
+	}
+	if strings.Contains(sinks.replies[0], "Hidden review request") {
+		t.Fatalf("queue reply included needs-review request: %q", sinks.replies[0])
+	}
+}
+
+func TestHandleQueueTreatsOnlyNeedsReviewAsEmpty(t *testing.T) {
+	database := &fakeDatabase{
+		activeByURL: map[string]bool{},
+		activeRequests: []models.DownloadQueueRequest{{
+			ID:     "review",
+			Name:   "Hidden review request",
+			Active: true,
+			State:  models.DownloadRequestStateNeedsReview,
+		}},
+	}
+	sinks := &testSinks{}
+	h := createTestHandler(database, sinks)
+
+	h.HandleQueue(testMessage("/queue"))
+
+	if len(sinks.replies) != 1 || sinks.replies[0] != "немає активних запитів на скачування..." {
+		t.Fatalf("queue replies = %#v, want empty-queue response", sinks.replies)
+	}
+}
+
 func TestHandleQueueUsesPersistedPlaylistStatusWithoutSpotifyLookup(t *testing.T) {
 	nextAttemptAt := time.Now().UTC().Add(2 * time.Hour).Unix()
 	database := &fakeDatabase{
