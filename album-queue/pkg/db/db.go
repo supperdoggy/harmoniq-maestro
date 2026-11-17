@@ -184,17 +184,9 @@ func (d *db) GetActiveRequests(ctx context.Context) ([]models.DownloadQueueReque
 }
 
 func (d *db) GetUnresolvedFailedTracks(ctx context.Context) ([]FailedTrack, error) {
-	filter := bson.M{
-		"track_metadata": bson.M{
-			"$elemMatch": bson.M{
-				"found": bson.M{"$ne": true},
-			},
-		},
-	}
-
-	cursor, err := d.downloadQueueRequestCollection.Find(ctx, filter)
+	cursor, err := d.downloadQueueRequestCollection.Find(ctx, unresolvedFailedRequestFilter())
 	if err != nil {
-		return nil, fmt.Errorf("failed to find requests with unresolved tracks: %w", err)
+		return nil, fmt.Errorf("failed to find failed requests with unresolved tracks: %w", err)
 	}
 	defer cursor.Close(ctx)
 
@@ -203,12 +195,21 @@ func (d *db) GetUnresolvedFailedTracks(ctx context.Context) ([]FailedTrack, erro
 		return nil, fmt.Errorf("failed to decode requests with unresolved tracks: %w", err)
 	}
 
-	tracks, err := filterUnresolvedFailedTracks(ctx, requests, d.musicFileExistsInsensitive, d.HasActiveRequestByURL)
+	failedTracks := collectUnresolvedFailedTracks(requests)
+	if len(failedTracks) == 0 {
+		return []FailedTrack{}, nil
+	}
+
+	activeURLs, err := d.findRunnableActiveRequestURLs(ctx, failedTracks)
+	if err != nil {
+		return nil, err
+	}
+	indexedTracks, err := d.findIndexedTrackKeys(ctx, failedTracks)
 	if err != nil {
 		return nil, err
 	}
 
-	return tracks, nil
+	return filterResolvedFailedTracks(failedTracks, activeURLs, indexedTracks), nil
 }
 
 func (d *db) GetUnresolvedFailedTrackByURL(ctx context.Context, trackURL string) (FailedTrack, error) {
@@ -221,12 +222,9 @@ func (d *db) GetUnresolvedFailedTrackByURL(ctx context.Context, trackURL string)
 }
 
 func (d *db) HasActiveRequestByURL(ctx context.Context, trackURL string) (bool, error) {
-	count, err := d.downloadQueueRequestCollection.CountDocuments(ctx, bson.M{
-		"spotify_url": trackURL,
-		"active":      true,
-	})
+	count, err := d.downloadQueueRequestCollection.CountDocuments(ctx, runnableActiveRequestFilter([]string{trackURL}))
 	if err != nil {
-		return false, fmt.Errorf("failed to check active request by url: %w", err)
+		return false, fmt.Errorf("failed to check runnable active request by url: %w", err)
 	}
 
 	return count > 0, nil
@@ -450,33 +448,143 @@ func (d *db) CheckSubscriptionExists(ctx context.Context, url string, creatorID 
 	return count > 0, nil
 }
 
-func (d *db) musicFileExistsInsensitive(ctx context.Context, artist, title string) (bool, error) {
-	if strings.TrimSpace(artist) == "" || strings.TrimSpace(title) == "" {
-		return false, nil
-	}
-
-	escapedArtist := regexp.QuoteMeta(artist)
-	escapedTitle := regexp.QuoteMeta(title)
-
-	count, err := d.musicFilesCollection.CountDocuments(ctx, bson.M{
-		"$and": []bson.M{
-			{"artist": bson.M{"$regex": "^" + escapedArtist + "$", "$options": "i"}},
-			{"title": bson.M{"$regex": "^" + escapedTitle + "$", "$options": "i"}},
+func unresolvedFailedRequestFilter() bson.M {
+	return bson.M{
+		"$and": bson.A{
+			bson.M{"track_metadata": bson.M{
+				"$elemMatch": bson.M{"found": bson.M{"$ne": true}},
+			}},
+			bson.M{"$or": bson.A{
+				bson.M{"state": bson.M{"$in": bson.A{
+					models.DownloadRequestStateNeedsReview,
+					models.DownloadRequestStateFailed,
+				}}},
+				bson.M{"$and": bson.A{
+					legacyRequestStateFilter(),
+					bson.M{"errored": true},
+				}},
+			}},
 		},
-	})
-	if err != nil {
-		return false, fmt.Errorf("failed to check indexed track existence: %w", err)
 	}
-
-	return count > 0, nil
 }
 
-func filterUnresolvedFailedTracks(
-	ctx context.Context,
-	requests []models.DownloadQueueRequest,
-	musicFileExists func(context.Context, string, string) (bool, error),
-	hasActiveRequestByURL func(context.Context, string) (bool, error),
-) ([]FailedTrack, error) {
+func legacyRequestStateFilter() bson.M {
+	return bson.M{"$or": bson.A{
+		bson.M{"state": bson.M{"$exists": false}},
+		bson.M{"state": nil},
+		bson.M{"state": ""},
+	}}
+}
+
+func runnableActiveRequestFilter(trackURLs []string) bson.M {
+	return bson.M{
+		"spotify_url": bson.M{"$in": trackURLs},
+		"active":      true,
+		"$or": bson.A{
+			bson.M{"state": bson.M{"$in": bson.A{
+				models.DownloadRequestStatePending,
+				models.DownloadRequestStateClaimed,
+				models.DownloadRequestStateResolving,
+				models.DownloadRequestStateDownloading,
+				models.DownloadRequestStateValidating,
+				models.DownloadRequestStateImported,
+				models.DownloadRequestStateRetryWait,
+			}}},
+			bson.M{"$and": bson.A{
+				legacyRequestStateFilter(),
+				bson.M{"errored": bson.M{"$ne": true}},
+			}},
+		},
+	}
+}
+
+func (d *db) findRunnableActiveRequestURLs(ctx context.Context, tracks []FailedTrack) (map[string]struct{}, error) {
+	trackURLs := make([]string, 0, len(tracks))
+	for _, track := range tracks {
+		trackURLs = append(trackURLs, track.SpotifyURL)
+	}
+
+	cursor, err := d.downloadQueueRequestCollection.Find(
+		ctx,
+		runnableActiveRequestFilter(trackURLs),
+		options.Find().SetProjection(bson.M{"_id": 0, "spotify_url": 1}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find runnable active requests: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	activeURLs := make(map[string]struct{})
+	for cursor.Next(ctx) {
+		var request struct {
+			SpotifyURL string `bson:"spotify_url"`
+		}
+		if err := cursor.Decode(&request); err != nil {
+			return nil, fmt.Errorf("failed to decode runnable active request: %w", err)
+		}
+		activeURLs[request.SpotifyURL] = struct{}{}
+	}
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate runnable active requests: %w", err)
+	}
+
+	return activeURLs, nil
+}
+
+func (d *db) findIndexedTrackKeys(ctx context.Context, tracks []FailedTrack) (map[string]struct{}, error) {
+	orPairs := make(bson.A, 0, len(tracks))
+	seenPairs := make(map[string]struct{}, len(tracks))
+	for _, track := range tracks {
+		artist := strings.TrimSpace(track.Artist)
+		title := strings.TrimSpace(track.Title)
+		if artist == "" || title == "" {
+			continue
+		}
+
+		key := failedTrackKey(artist, title)
+		if _, seen := seenPairs[key]; seen {
+			continue
+		}
+		seenPairs[key] = struct{}{}
+		orPairs = append(orPairs, bson.M{
+			"artist": bson.M{"$regex": "^" + regexp.QuoteMeta(artist) + "$", "$options": "i"},
+			"title":  bson.M{"$regex": "^" + regexp.QuoteMeta(title) + "$", "$options": "i"},
+		})
+	}
+
+	indexedTracks := make(map[string]struct{})
+	if len(orPairs) == 0 {
+		return indexedTracks, nil
+	}
+
+	cursor, err := d.musicFilesCollection.Find(
+		ctx,
+		bson.M{"$or": orPairs},
+		options.Find().SetProjection(bson.M{"_id": 0, "artist": 1, "title": 1}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find indexed failed tracks: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var musicFile struct {
+			Artist string `bson:"artist"`
+			Title  string `bson:"title"`
+		}
+		if err := cursor.Decode(&musicFile); err != nil {
+			return nil, fmt.Errorf("failed to decode indexed failed track: %w", err)
+		}
+		indexedTracks[failedTrackKey(musicFile.Artist, musicFile.Title)] = struct{}{}
+	}
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate indexed failed tracks: %w", err)
+	}
+
+	return indexedTracks, nil
+}
+
+func collectUnresolvedFailedTracks(requests []models.DownloadQueueRequest) []FailedTrack {
 	failedByURL := make(map[string]FailedTrack)
 
 	for _, request := range requests {
@@ -487,22 +595,6 @@ func filterUnresolvedFailedTracks(
 
 		for _, track := range request.TrackMetadata {
 			if track.Found || strings.TrimSpace(track.SpotifyURL) == "" {
-				continue
-			}
-
-			existsInLibrary, err := musicFileExists(ctx, track.Artist, track.Title)
-			if err != nil {
-				return nil, err
-			}
-			if existsInLibrary {
-				continue
-			}
-
-			hasActive, err := hasActiveRequestByURL(ctx, track.SpotifyURL)
-			if err != nil {
-				return nil, err
-			}
-			if hasActive {
 				continue
 			}
 
@@ -537,14 +629,37 @@ func filterUnresolvedFailedTracks(
 		failedTracks = append(failedTracks, track)
 	}
 
-	sort.Slice(failedTracks, func(i, j int) bool {
-		if failedTracks[i].LastSeenAt == failedTracks[j].LastSeenAt {
-			return failedTracks[i].SpotifyURL < failedTracks[j].SpotifyURL
+	return failedTracks
+}
+
+func filterResolvedFailedTracks(
+	failedTracks []FailedTrack,
+	activeURLs map[string]struct{},
+	indexedTracks map[string]struct{},
+) []FailedTrack {
+	unresolvedTracks := make([]FailedTrack, 0, len(failedTracks))
+	for _, track := range failedTracks {
+		if _, active := activeURLs[track.SpotifyURL]; active {
+			continue
 		}
-		return failedTracks[i].LastSeenAt > failedTracks[j].LastSeenAt
+		if _, indexed := indexedTracks[failedTrackKey(track.Artist, track.Title)]; indexed {
+			continue
+		}
+		unresolvedTracks = append(unresolvedTracks, track)
+	}
+
+	sort.Slice(unresolvedTracks, func(i, j int) bool {
+		if unresolvedTracks[i].LastSeenAt == unresolvedTracks[j].LastSeenAt {
+			return unresolvedTracks[i].SpotifyURL < unresolvedTracks[j].SpotifyURL
+		}
+		return unresolvedTracks[i].LastSeenAt > unresolvedTracks[j].LastSeenAt
 	})
 
-	return failedTracks, nil
+	return unresolvedTracks
+}
+
+func failedTrackKey(artist, title string) string {
+	return strings.ToLower(strings.TrimSpace(artist)) + "\x00" + strings.ToLower(strings.TrimSpace(title))
 }
 
 func selectFailedTrackByURL(tracks []FailedTrack, trackURL string) (FailedTrack, error) {

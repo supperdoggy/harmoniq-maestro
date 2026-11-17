@@ -1,7 +1,6 @@
 package db
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -10,57 +9,38 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
-func TestFilterUnresolvedFailedTracksExcludesIndexedTracks(t *testing.T) {
-	requests := []models.DownloadQueueRequest{
-		{
-			ID:        "r1",
-			UpdatedAt: 10,
-			TrackMetadata: []spotify.TrackMetadata{
-				{SpotifyURL: "https://open.spotify.com/track/one", Artist: "a", Title: "x", Found: false, FailedAttempts: 3},
-			},
-		},
+func TestFilterResolvedFailedTracksExcludesIndexedTracks(t *testing.T) {
+	track := FailedTrack{
+		SpotifyURL: "https://open.spotify.com/track/one",
+		Artist:     "Artist",
+		Title:      "Title",
 	}
 
-	tracks, err := filterUnresolvedFailedTracks(
-		context.Background(),
-		requests,
-		func(context.Context, string, string) (bool, error) { return true, nil },
-		func(context.Context, string) (bool, error) { return false, nil },
+	tracks := filterResolvedFailedTracks(
+		[]FailedTrack{track},
+		map[string]struct{}{},
+		map[string]struct{}{failedTrackKey("artist", "title"): {}},
 	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	if len(tracks) != 0 {
 		t.Fatalf("expected no unresolved tracks, got %d", len(tracks))
 	}
 }
 
-func TestFilterUnresolvedFailedTracksExcludesActiveDuplicates(t *testing.T) {
-	requests := []models.DownloadQueueRequest{
-		{
-			ID:        "r1",
-			UpdatedAt: 10,
-			TrackMetadata: []spotify.TrackMetadata{
-				{SpotifyURL: "https://open.spotify.com/track/one", Artist: "a", Title: "x", Found: false, FailedAttempts: 3},
-			},
-		},
-	}
+func TestFilterResolvedFailedTracksExcludesRunnableDuplicates(t *testing.T) {
+	trackURL := "https://open.spotify.com/track/one"
+	track := FailedTrack{SpotifyURL: trackURL, Artist: "a", Title: "x"}
 
-	tracks, err := filterUnresolvedFailedTracks(
-		context.Background(),
-		requests,
-		func(context.Context, string, string) (bool, error) { return false, nil },
-		func(context.Context, string) (bool, error) { return true, nil },
+	tracks := filterResolvedFailedTracks(
+		[]FailedTrack{track},
+		map[string]struct{}{trackURL: {}},
+		map[string]struct{}{},
 	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	if len(tracks) != 0 {
 		t.Fatalf("expected no unresolved tracks, got %d", len(tracks))
 	}
 }
 
-func TestFilterUnresolvedFailedTracksDedupesByURL(t *testing.T) {
+func TestCollectUnresolvedFailedTracksDedupesByURL(t *testing.T) {
 	url := "https://open.spotify.com/track/retry"
 	requests := []models.DownloadQueueRequest{
 		{
@@ -79,15 +59,7 @@ func TestFilterUnresolvedFailedTracksDedupesByURL(t *testing.T) {
 		},
 	}
 
-	tracks, err := filterUnresolvedFailedTracks(
-		context.Background(),
-		requests,
-		func(context.Context, string, string) (bool, error) { return false, nil },
-		func(context.Context, string) (bool, error) { return false, nil },
-	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	tracks := collectUnresolvedFailedTracks(requests)
 	if len(tracks) != 1 {
 		t.Fatalf("expected one deduped track, got %d", len(tracks))
 	}
@@ -102,6 +74,21 @@ func TestFilterUnresolvedFailedTracksDedupesByURL(t *testing.T) {
 	}
 	if tracks[0].Artist != "a2" || tracks[0].Title != "x2" {
 		t.Fatalf("expected latest artist/title from most recent request, got %+v", tracks[0])
+	}
+}
+
+func TestFilterResolvedFailedTracksSortsNewestFirst(t *testing.T) {
+	tracks := filterResolvedFailedTracks(
+		[]FailedTrack{
+			{SpotifyURL: "https://open.spotify.com/track/older", LastSeenAt: 10},
+			{SpotifyURL: "https://open.spotify.com/track/newer", LastSeenAt: 20},
+		},
+		map[string]struct{}{},
+		map[string]struct{}{},
+	)
+
+	if len(tracks) != 2 || tracks[0].LastSeenAt != 20 || tracks[1].LastSeenAt != 10 {
+		t.Fatalf("tracks are not sorted newest first: %+v", tracks)
 	}
 }
 
