@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -21,6 +22,7 @@ type Database interface {
 	NewDownloadRequest(ctx context.Context, url, name string, creatorID int64, objectType spotify.SpotifyObjectType, expectedTrackCount int, trackMetadata []spotify.TrackMetadata) error
 	GetActiveRequests(ctx context.Context) ([]models.DownloadQueueRequest, error)
 	GetUnresolvedFailedTracks(ctx context.Context) ([]FailedTrack, error)
+	GetUnresolvedFailedTracksPage(ctx context.Context, page, pageSize int) (FailedTracksPage, error)
 	GetUnresolvedFailedTrackByURL(ctx context.Context, trackURL string) (FailedTrack, error)
 	HasActiveRequestByURL(ctx context.Context, trackURL string) (bool, error)
 	DeactivateRequest(ctx context.Context, id string) error
@@ -51,6 +53,13 @@ type FailedTrack struct {
 	FailedAttempts int    `json:"failed_attempts"`
 	SourceCount    int    `json:"source_count"`
 	LastSeenAt     int64  `json:"last_seen_at"`
+}
+
+type FailedTracksPage struct {
+	Tracks   []FailedTrack `json:"tracks"`
+	Page     int           `json:"page"`
+	PageSize int           `json:"page_size"`
+	Total    int           `json:"total"`
 }
 
 type db struct {
@@ -210,6 +219,15 @@ func (d *db) GetUnresolvedFailedTracks(ctx context.Context) ([]FailedTrack, erro
 	}
 
 	return filterResolvedFailedTracks(failedTracks, activeURLs, indexedTracks), nil
+}
+
+func (d *db) GetUnresolvedFailedTracksPage(ctx context.Context, page, pageSize int) (FailedTracksPage, error) {
+	tracks, err := d.GetUnresolvedFailedTracks(ctx)
+	if err != nil {
+		return FailedTracksPage{}, err
+	}
+
+	return paginateFailedTracks(tracks, page, pageSize)
 }
 
 func (d *db) GetUnresolvedFailedTrackByURL(ctx context.Context, trackURL string) (FailedTrack, error) {
@@ -660,6 +678,40 @@ func filterResolvedFailedTracks(
 
 func failedTrackKey(artist, title string) string {
 	return strings.ToLower(strings.TrimSpace(artist)) + "\x00" + strings.ToLower(strings.TrimSpace(title))
+}
+
+func paginateFailedTracks(tracks []FailedTrack, page, pageSize int) (FailedTracksPage, error) {
+	if page < 0 {
+		return FailedTracksPage{}, errors.New("page must not be negative")
+	}
+	if pageSize <= 0 {
+		return FailedTracksPage{}, errors.New("page size must be positive")
+	}
+
+	result := FailedTracksPage{
+		Tracks:   []FailedTrack{},
+		Page:     page,
+		PageSize: pageSize,
+		Total:    len(tracks),
+	}
+	if len(tracks) == 0 {
+		if page != 0 {
+			return FailedTracksPage{}, errors.New("page out of range")
+		}
+		return result, nil
+	}
+
+	start := page * pageSize
+	if start >= len(tracks) {
+		return FailedTracksPage{}, errors.New("page out of range")
+	}
+	end := start + pageSize
+	if end > len(tracks) {
+		end = len(tracks)
+	}
+	result.Tracks = append(result.Tracks, tracks[start:end]...)
+
+	return result, nil
 }
 
 func selectFailedTrackByURL(tracks []FailedTrack, trackURL string) (FailedTrack, error) {

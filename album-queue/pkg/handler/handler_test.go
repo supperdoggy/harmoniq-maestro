@@ -69,6 +69,29 @@ func (f *fakeDatabase) GetUnresolvedFailedTracks(context.Context) ([]db.FailedTr
 	return f.unresolvedTracks, nil
 }
 
+func (f *fakeDatabase) GetUnresolvedFailedTracksPage(_ context.Context, page, pageSize int) (db.FailedTracksPage, error) {
+	if page < 0 || pageSize <= 0 {
+		return db.FailedTracksPage{}, errors.New("invalid page")
+	}
+	start := page * pageSize
+	if start >= len(f.unresolvedTracks) {
+		if len(f.unresolvedTracks) == 0 && page == 0 {
+			return db.FailedTracksPage{Tracks: []db.FailedTrack{}, Page: page, PageSize: pageSize}, nil
+		}
+		return db.FailedTracksPage{}, errors.New("page out of range")
+	}
+	end := start + pageSize
+	if end > len(f.unresolvedTracks) {
+		end = len(f.unresolvedTracks)
+	}
+	return db.FailedTracksPage{
+		Tracks:   append([]db.FailedTrack(nil), f.unresolvedTracks[start:end]...),
+		Page:     page,
+		PageSize: pageSize,
+		Total:    len(f.unresolvedTracks),
+	}, nil
+}
+
 func (f *fakeDatabase) GetUnresolvedFailedTrackByURL(_ context.Context, trackURL string) (db.FailedTrack, error) {
 	for _, track := range f.unresolvedTracks {
 		if track.SpotifyURL == trackURL {

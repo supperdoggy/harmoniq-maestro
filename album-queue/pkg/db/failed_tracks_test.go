@@ -92,6 +92,32 @@ func TestFilterResolvedFailedTracksSortsNewestFirst(t *testing.T) {
 	}
 }
 
+func TestPaginateFailedTracksReturnsRequestedSliceAndTotal(t *testing.T) {
+	tracks := []FailedTrack{
+		{SpotifyURL: "one"},
+		{SpotifyURL: "two"},
+		{SpotifyURL: "three"},
+	}
+
+	page, err := paginateFailedTracks(tracks, 1, 2)
+	if err != nil {
+		t.Fatalf("paginate failed tracks: %v", err)
+	}
+	if page.Total != 3 || page.Page != 1 || page.PageSize != 2 {
+		t.Fatalf("unexpected page metadata: %+v", page)
+	}
+	if len(page.Tracks) != 1 || page.Tracks[0].SpotifyURL != "three" {
+		t.Fatalf("unexpected page tracks: %+v", page.Tracks)
+	}
+}
+
+func TestPaginateFailedTracksRejectsOutOfRangePage(t *testing.T) {
+	_, err := paginateFailedTracks([]FailedTrack{{SpotifyURL: "one"}}, 1, 5)
+	if err == nil {
+		t.Fatal("expected out-of-range error")
+	}
+}
+
 func TestSelectFailedTrackByURLReturnsNotFoundForResolvedOrMissing(t *testing.T) {
 	tracks := []FailedTrack{{SpotifyURL: "https://open.spotify.com/track/exists"}}
 
