@@ -400,7 +400,8 @@ func (h *handler) HandleQueue(m *telebot.Message) {
 // queueVisibleRequests keeps /queue aligned with work the acquisition worker
 // can still claim or resume. needs_review belongs in /failed, while terminal
 // and inactive records are historical rather than queued work. An empty state
-// remains visible because legacy requests are treated as pending by the worker.
+// remains visible when it is not errored because legacy requests are treated
+// as pending by the worker.
 func queueVisibleRequests(requests []models.DownloadQueueRequest) []models.DownloadQueueRequest {
 	visible := make([]models.DownloadQueueRequest, 0, len(requests))
 	for _, request := range requests {
@@ -408,8 +409,11 @@ func queueVisibleRequests(requests []models.DownloadQueueRequest) []models.Downl
 			continue
 		}
 		switch request.State {
-		case "",
-			models.DownloadRequestStatePending,
+		case "":
+			if !request.Errored {
+				visible = append(visible, request)
+			}
+		case models.DownloadRequestStatePending,
 			models.DownloadRequestStateClaimed,
 			models.DownloadRequestStateResolving,
 			models.DownloadRequestStateDownloading,

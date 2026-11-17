@@ -257,9 +257,11 @@ func TestQueueVisibleRequestsFiltersNonRunnableStates(t *testing.T) {
 		name    string
 		active  bool
 		state   models.DownloadRequestState
+		errored bool
 		visible bool
 	}{
 		{name: "legacy pending", active: true, state: "", visible: true},
+		{name: "legacy errored", active: true, state: "", errored: true},
 		{name: "pending", active: true, state: models.DownloadRequestStatePending, visible: true},
 		{name: "claimed", active: true, state: models.DownloadRequestStateClaimed, visible: true},
 		{name: "resolving", active: true, state: models.DownloadRequestStateResolving, visible: true},
@@ -277,9 +279,10 @@ func TestQueueVisibleRequestsFiltersNonRunnableStates(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			visible := queueVisibleRequests([]models.DownloadQueueRequest{{
-				ID:     test.name,
-				Active: test.active,
-				State:  test.state,
+				ID:      test.name,
+				Active:  test.active,
+				State:   test.state,
+				Errored: test.errored,
 			}})
 			if got := len(visible) == 1; got != test.visible {
 				t.Fatalf("visible = %t, want %t", got, test.visible)
