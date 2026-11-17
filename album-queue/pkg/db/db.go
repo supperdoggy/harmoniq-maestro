@@ -21,7 +21,6 @@ import (
 type Database interface {
 	NewDownloadRequest(ctx context.Context, url, name string, creatorID int64, objectType spotify.SpotifyObjectType, expectedTrackCount int, trackMetadata []spotify.TrackMetadata) error
 	GetActiveRequests(ctx context.Context) ([]models.DownloadQueueRequest, error)
-	GetUnresolvedFailedTracks(ctx context.Context) ([]FailedTrack, error)
 	GetUnresolvedFailedTracksPage(ctx context.Context, page, pageSize int) (FailedTracksPage, error)
 	GetUnresolvedFailedTrackByURL(ctx context.Context, trackURL string) (FailedTrack, error)
 	HasActiveRequestByURL(ctx context.Context, trackURL string) (bool, error)
@@ -192,7 +191,7 @@ func (d *db) GetActiveRequests(ctx context.Context) ([]models.DownloadQueueReque
 	return requests, nil
 }
 
-func (d *db) GetUnresolvedFailedTracks(ctx context.Context) ([]FailedTrack, error) {
+func (d *db) getUnresolvedFailedTracks(ctx context.Context) ([]FailedTrack, error) {
 	cursor, err := d.downloadQueueRequestCollection.Find(ctx, unresolvedFailedRequestFilter())
 	if err != nil {
 		return nil, fmt.Errorf("failed to find failed requests with unresolved tracks: %w", err)
@@ -222,7 +221,7 @@ func (d *db) GetUnresolvedFailedTracks(ctx context.Context) ([]FailedTrack, erro
 }
 
 func (d *db) GetUnresolvedFailedTracksPage(ctx context.Context, page, pageSize int) (FailedTracksPage, error) {
-	tracks, err := d.GetUnresolvedFailedTracks(ctx)
+	tracks, err := d.getUnresolvedFailedTracks(ctx)
 	if err != nil {
 		return FailedTracksPage{}, err
 	}
@@ -231,7 +230,7 @@ func (d *db) GetUnresolvedFailedTracksPage(ctx context.Context, page, pageSize i
 }
 
 func (d *db) GetUnresolvedFailedTrackByURL(ctx context.Context, trackURL string) (FailedTrack, error) {
-	tracks, err := d.GetUnresolvedFailedTracks(ctx)
+	tracks, err := d.getUnresolvedFailedTracks(ctx)
 	if err != nil {
 		return FailedTrack{}, err
 	}

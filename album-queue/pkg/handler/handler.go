@@ -445,19 +445,19 @@ func (h *handler) HandleFailed(m *telebot.Message) {
 		return
 	}
 
-	failedTracks, err := h.db.GetUnresolvedFailedTracks(context.Background())
+	failedPage, err := h.db.GetUnresolvedFailedTracksPage(context.Background(), 0, failedPageSize)
 	if err != nil {
 		h.log.Error("Failed to get unresolved failed tracks", zap.Error(err))
 		h.reply(m, "не получилось дістати список фейлів на скачування...")
 		return
 	}
 
-	if len(failedTracks) == 0 {
+	if failedPage.Total == 0 {
 		h.reply(m, "нема невирішених фейлів на скачування.")
 		return
 	}
 
-	text, markup, err := renderFailedTracksPage(failedTracks, 0)
+	text, markup, err := renderFailedTracksPage(failedPage)
 	if err != nil {
 		h.log.Error("Failed to render failed tracks page", zap.Error(err))
 		h.reply(m, "не получилось зібрати сторінку фейлів...")
@@ -483,14 +483,14 @@ func (h *handler) HandleFailedPage(c *telebot.Callback) {
 		return
 	}
 
-	failedTracks, err := h.db.GetUnresolvedFailedTracks(context.Background())
+	failedPage, err := h.db.GetUnresolvedFailedTracksPage(context.Background(), page, failedPageSize)
 	if err != nil {
 		h.log.Error("Failed to get unresolved failed tracks", zap.Error(err))
 		_ = h.respondCallbackFn(c, "не получилось оновити список фейлів", true)
 		return
 	}
 
-	if len(failedTracks) == 0 {
+	if failedPage.Total == 0 {
 		if c.Message != nil {
 			if err := h.editFailedPageFn(c.Message, "нема невирішених фейлів на скачування.", nil); err != nil {
 				h.log.Error("Failed to edit failed page to empty state", zap.Error(err))
@@ -500,7 +500,7 @@ func (h *handler) HandleFailedPage(c *telebot.Callback) {
 		return
 	}
 
-	text, markup, err := renderFailedTracksPage(failedTracks, page)
+	text, markup, err := renderFailedTracksPage(failedPage)
 	if err != nil {
 		_ = h.respondCallbackFn(c, "невірний номер сторінки", true)
 		return
@@ -598,28 +598,24 @@ func isValidSpotifyTrackURL(url string) bool {
 	return utils.IsValidSpotifyURL(url) && strings.HasPrefix(url, "https://open.spotify.com/track/")
 }
 
-func renderFailedTracksPage(failedTracks []db.FailedTrack, page int) (string, *telebot.ReplyMarkup, error) {
-	if len(failedTracks) == 0 {
+func renderFailedTracksPage(failedPage db.FailedTracksPage) (string, *telebot.ReplyMarkup, error) {
+	if failedPage.Total <= 0 || len(failedPage.Tracks) == 0 {
 		return "", nil, errors.New("failed tracks list is empty")
 	}
+	if failedPage.PageSize <= 0 {
+		return "", nil, errors.New("invalid page size")
+	}
 
-	totalPages := (len(failedTracks) + failedPageSize - 1) / failedPageSize
-	if page < 0 || page >= totalPages {
+	totalPages := (failedPage.Total + failedPage.PageSize - 1) / failedPage.PageSize
+	if failedPage.Page < 0 || failedPage.Page >= totalPages {
 		return "", nil, errors.New("page out of range")
 	}
 
-	start := page * failedPageSize
-	end := start + failedPageSize
-	if end > len(failedTracks) {
-		end = len(failedTracks)
-	}
-
 	var response strings.Builder
-	response.WriteString(fmt.Sprintf("Невирішені фейли на скачування: %d\n", len(failedTracks)))
-	response.WriteString(fmt.Sprintf("Сторінка %d/%d\n\n", page+1, totalPages))
+	response.WriteString(fmt.Sprintf("Невирішені фейли на скачування: %d\n", failedPage.Total))
+	response.WriteString(fmt.Sprintf("Сторінка %d/%d\n\n", failedPage.Page+1, totalPages))
 
-	for i := start; i < end; i++ {
-		track := failedTracks[i]
+	for i, track := range failedPage.Tracks {
 
 		artist := strings.TrimSpace(track.Artist)
 		if artist == "" {
@@ -631,7 +627,8 @@ func renderFailedTracksPage(failedTracks []db.FailedTrack, page int) (string, *t
 			title = "невідома назва"
 		}
 
-		response.WriteString(fmt.Sprintf("%d. %s - %s\n", i+1, artist, title))
+		position := failedPage.Page*failedPage.PageSize + i + 1
+		response.WriteString(fmt.Sprintf("%d. %s - %s\n", position, artist, title))
 		response.WriteString(fmt.Sprintf("   🔗 %s\n", track.SpotifyURL))
 		response.WriteString(fmt.Sprintf("   ⚠️ Спроб: %d | Джерел: %d\n\n", track.FailedAttempts, track.SourceCount))
 	}
@@ -643,11 +640,11 @@ func renderFailedTracksPage(failedTracks []db.FailedTrack, page int) (string, *t
 	markup := &telebot.ReplyMarkup{}
 	row := make([]telebot.Btn, 0, 2)
 
-	if page > 0 {
-		row = append(row, markup.Data("⬅️ Назад", failedPageCallbackUnique, strconv.Itoa(page-1)))
+	if failedPage.Page > 0 {
+		row = append(row, markup.Data("⬅️ Назад", failedPageCallbackUnique, strconv.Itoa(failedPage.Page-1)))
 	}
-	if page < totalPages-1 {
-		row = append(row, markup.Data("Вперед ➡️", failedPageCallbackUnique, strconv.Itoa(page+1)))
+	if failedPage.Page < totalPages-1 {
+		row = append(row, markup.Data("Вперед ➡️", failedPageCallbackUnique, strconv.Itoa(failedPage.Page+1)))
 	}
 
 	if len(row) > 0 {

@@ -25,12 +25,18 @@ type newRequestCall struct {
 	trackMetadata      []spotify.TrackMetadata
 }
 
+type failedPageCall struct {
+	page     int
+	pageSize int
+}
+
 type fakeDatabase struct {
 	unresolvedTracks []db.FailedTrack
 	activeByURL      map[string]bool
 	activeRequests   []models.DownloadQueueRequest
 	activePlaylists  []models.PlaylistRequest
 	musicFiles       []models.MusicFile
+	failedPageCalls  []failedPageCall
 
 	newRequestErr   error
 	newRequests     []newRequestCall
@@ -65,11 +71,8 @@ func (f *fakeDatabase) GetActiveRequests(context.Context) ([]models.DownloadQueu
 	return append([]models.DownloadQueueRequest(nil), f.activeRequests...), nil
 }
 
-func (f *fakeDatabase) GetUnresolvedFailedTracks(context.Context) ([]db.FailedTrack, error) {
-	return f.unresolvedTracks, nil
-}
-
 func (f *fakeDatabase) GetUnresolvedFailedTracksPage(_ context.Context, page, pageSize int) (db.FailedTracksPage, error) {
+	f.failedPageCalls = append(f.failedPageCalls, failedPageCall{page: page, pageSize: pageSize})
 	if page < 0 || pageSize <= 0 {
 		return db.FailedTracksPage{}, errors.New("invalid page")
 	}
@@ -555,6 +558,9 @@ func TestHandleFailedFormatsFlatList(t *testing.T) {
 	if len(sinks.sentPages) != 1 {
 		t.Fatalf("expected one paged send, got %d", len(sinks.sentPages))
 	}
+	if len(db.failedPageCalls) != 1 || db.failedPageCalls[0] != (failedPageCall{page: 0, pageSize: failedPageSize}) {
+		t.Fatalf("unexpected failed page calls: %+v", db.failedPageCalls)
+	}
 	body := sinks.sentPages[0].text
 	checks := []string{
 		"Невирішені фейли на скачування: 2",
@@ -635,6 +641,9 @@ func TestHandleFailedPageEditsMessageAndResponds(t *testing.T) {
 
 	if len(sinks.editedPages) != 1 {
 		t.Fatalf("expected one edited page, got %d", len(sinks.editedPages))
+	}
+	if len(db.failedPageCalls) != 1 || db.failedPageCalls[0] != (failedPageCall{page: 1, pageSize: failedPageSize}) {
+		t.Fatalf("unexpected failed page calls: %+v", db.failedPageCalls)
 	}
 	if !strings.Contains(sinks.editedPages[0].text, "Сторінка 2/2") {
 		t.Fatalf("expected second page content, got: %q", sinks.editedPages[0].text)
